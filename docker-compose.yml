@@ -1,0 +1,45 @@
+# esign — full stack: Postgres + backend API + Caddy edge (TLS + static frontend).
+# Prereqs on the host: Docker, a DNS A-record pointing your domain at the host,
+# a built frontend (`cd frontend && npm run build`), and backend/.env filled in.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: esign
+      POSTGRES_USER: esign
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      # Override to point at the compose Postgres service
+      DATABASE_URL: postgres://esign:${DB_PASSWORD}@db:5432/esign
+      # AWS creds for S3 + SES (or attach an instance role instead of these)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend/dist:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

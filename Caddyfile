@@ -1,0 +1,18 @@
+# esign edge — auto-TLS, serves the built frontend, proxies /api to the backend.
+# Replace the hostname with your domain. Caddy provisions a Let's Encrypt cert automatically.
+esign.example.com {
+	encode zstd gzip
+
+	# API: strip the /api prefix and forward to the backend (routes live at root)
+	handle /api/* {
+		uri strip_prefix /api
+		reverse_proxy backend:4000
+	}
+
+	# Frontend: static SPA with history-fallback
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

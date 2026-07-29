@@ -1,0 +1,17 @@
+* { box-sizing: border-box; }
+body { margin: 0; background: #fafafa; color: #222; font: 15px/1.5 system-ui, sans-serif; }
+button { cursor: pointer; font: inherit; }
+input[type="email"], input[type="file"], input[type="text"] {
+  font: inherit; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; width: 100%;
+}
+.btn { background: #2563eb; color: white; border: 0; padding: 10px 16px; border-radius: 6px; font-weight: 500; }
+.btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.btn-secondary { background: #e5e7eb; color: #222; }
+.card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+.muted { color: #6b7280; font-size: 0.9em; }
+.row { display: flex; gap: 12px; align-items: center; }
+label { display: block; margin-bottom: 6px; font-weight: 500; font-size: 0.9em; }
+.field { margin-bottom: 14px; }
+h1 { font-size: 22px; margin: 0 0 16px; }
+h2 { font-size: 16px; margin: 0 0 8px; }
+pre { background: #f3f4f6; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
