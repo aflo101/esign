@@ -15,6 +15,9 @@ export default function App() {
         <Routes>
           <Route path="/" element={<LoginGate><Upload /></LoginGate>} />
           <Route path="/prepare/:id" element={<LoginGate><Prepare /></LoginGate>} />
+          {/* /s/ is the emailed link — short, opaque token. /sign/ kept as an alias
+              so any link issued before the token change still resolves. */}
+          <Route path="/s/:token" element={<Sign />} />
           <Route path="/sign/:token" element={<Sign />} />
           <Route path="/done" element={<Done />} />
         </Routes>

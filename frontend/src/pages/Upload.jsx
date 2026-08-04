@@ -14,10 +14,24 @@ export default function Upload() {
     e.preventDefault()
     setBusy(true); setError(null)
     try {
-      const fd = new FormData()
-      fd.append('file', file)
-      fd.append('sender_email', senderEmail)
-      const up = await fetch('/api/documents', { method: 'POST', headers: authHeaders(), body: fd }).then(r => r.json())
+      // Three steps: mint a presigned URL, PUT the bytes straight to S3, then register.
+      // The file never passes through the API — Lambda caps payloads at 6MB.
+      const init = await fetch('/api/documents/init', {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ filename: file.name }),
+      }).then(r => r.json())
+      if (init.error) throw new Error(init.error)
+      if (file.size > init.maxBytes) throw new Error(`file too large (max ${Math.round(init.maxBytes / 1048576)}MB)`)
+
+      const put = await fetch(init.uploadUrl, {
+        method: 'PUT', headers: { 'Content-Type': 'application/pdf' }, body: file,
+      })
+      if (!put.ok) throw new Error(`upload failed (${put.status})`)
+
+      const up = await fetch(`/api/documents/${init.id}/complete`, {
+        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ filename: file.name, sender_email: senderEmail }),
+      }).then(r => r.json())
       if (up.error) throw new Error(up.error)
       // Hand off to the Prepare step (place fields, then send) — carry the emails forward.
       navigate(`/prepare/${up.id}`, {

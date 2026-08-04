@@ -39,7 +39,10 @@ export default function Prepare() {
     let cancelled = false
     ;(async () => {
       try {
-        const pdf = await pdfjsLib.getDocument({ url: `/api/documents/${id}/pdf`, httpHeaders: authHeaders() }).promise
+        // Presigned S3 URL — the PDF bytes don't pass through the API.
+        const pdfRes = await fetch(`/api/documents/${id}/pdf`, { headers: authHeaders() }).then(r => r.json())
+        if (pdfRes.error) throw new Error(pdfRes.error)
+        const pdf = await pdfjsLib.getDocument({ url: pdfRes.url }).promise
         if (cancelled) return
         pdfRef.current = pdf
         setNumPages(pdf.numPages)

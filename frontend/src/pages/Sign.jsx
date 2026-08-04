@@ -21,6 +21,7 @@ export default function Sign() {
   const [flash, setFlash] = useState(null)      // field id to highlight
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [consented, setConsented] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -30,7 +31,10 @@ export default function Sign() {
         if (m.error) throw new Error(m.error)
         if (cancelled) return
         setMeta(m)
-        const pdf = await pdfjsLib.getDocument(`/api/sign/${token}/pdf`).promise
+        // The API hands back a short-lived presigned S3 URL; bytes come straight from S3.
+        const { url, error } = await fetch(`/api/sign/${token}/pdf`).then(r => r.json())
+        if (error) throw new Error(error)
+        const pdf = await pdfjsLib.getDocument({ url }).promise
         if (cancelled) return
         pdfRef.current = pdf
         setNumPages(pdf.numPages)
@@ -54,6 +58,7 @@ export default function Sign() {
   function setValue(id, v) { setValues(prev => ({ ...prev, [id]: v })) }
 
   function clickField(f) {
+    if (!consented) return // fields are inert until consent is given
     if (f.type === 'checkbox') return setValue(f.id, !values[f.id])
     if (f.type === 'date') return setValue(f.id, values[f.id] ? '' : today())
     setEditing(f) // signature/initials/name/text → modal
@@ -75,7 +80,7 @@ export default function Sign() {
     try {
       const res = await fetch(`/api/sign/${token}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ values }),
+        body: JSON.stringify({ values, consent: consented }),
       }).then(r => r.json())
       if (res.error) throw new Error(res.error)
       navigate('/done', { state: { signed_hash: res.signed_hash, token } })
@@ -94,9 +99,31 @@ export default function Sign() {
       <h1>Sign: {meta.filename}</h1>
       <p className="muted">Signing as {meta.signer}</p>
 
+      {/* ESIGN Act / UETA: consent to transact electronically and intent to be bound must
+          be captured affirmatively, before signing, and recorded in the audit trail. */}
+      {!consented && (
+        <div className="card" style={{ borderColor: '#2563eb', background: '#eff6ff' }}>
+          <h2 style={{ marginTop: 0, fontSize: 17 }}>Before you sign</h2>
+          <p style={{ fontSize: 14, lineHeight: 1.6, margin: '0 0 12px' }}>
+            {meta.consent?.statement}
+          </p>
+          <p className="muted" style={{ fontSize: 13, lineHeight: 1.6, margin: '0 0 14px' }}>
+            You may request a paper copy or withdraw consent at any time by replying to the
+            email that delivered this document. To view and sign, you need a current web
+            browser and the ability to receive PDF attachments by email.
+          </p>
+          <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer', fontSize: 14 }}>
+            <input type="checkbox" style={{ marginTop: 3 }} onChange={e => setConsented(e.target.checked)} />
+            <span>I agree to sign this document electronically.</span>
+          </label>
+        </div>
+      )}
+
       {/* Guided action bar */}
       <div className="card" style={{ position: 'sticky', top: 8, zIndex: 20, display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-        {allDone ? (
+        {!consented ? (
+          <span className="muted">Agree to sign electronically above to begin.</span>
+        ) : allDone ? (
           <>
             <strong style={{ color: '#15803d' }}>All required fields complete.</strong>
             <button className="btn" style={{ marginLeft: 'auto' }} disabled={submitting} onClick={finish}>

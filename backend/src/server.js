@@ -1,27 +1,74 @@
 import express from 'express';
 import cors from 'cors';
-import multer from 'multer';
 import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import PDFKitDocument from 'pdfkit';
 import 'dotenv/config';
 
-import { pool, logEvent } from './db.js';
-import { putObject, getObject } from './storage.js';
+import { logEvent, clientIp } from './db.js';
+import * as repo from './repo.js';
+import { putObject, getObject, presignPut, presignGet, headObject } from './storage.js';
 import { sendEmail } from './email.js';
+import { signatureRequestEmail, completionEmail } from './templates.js';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+app.use(express.json({ limit: '1mb' }));
+
+// Every unauthenticated signer route shares one budget per IP.
+const signerLimit = () => rateLimit({ max: 120, windowSeconds: 900, name: 'sign' });
+
+// The Lambda Function URL is AuthType:NONE, so CloudFront proves it's the caller with a
+// shared secret header instead. OAC was rejected: it SigV4-signs into the Authorization
+// header — clobbering the sender's Bearer token — and requires the client to compute
+// x-amz-content-sha256 on every POST/PUT, which CloudFront does not do.
+const ORIGIN_SECRET = process.env.ORIGIN_SECRET || null;
+if (ORIGIN_SECRET) {
+  app.use((req, res, next) => {
+    if (req.path === '/health') return next();
+    if (req.headers['x-esign-origin'] !== ORIGIN_SECRET) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    next();
+  });
+}
+
+// PDF bytes never transit this service — the browser PUTs to S3 and GETs from S3 via
+// presigned URLs. Lambda caps request AND response payloads at 6MB, so streaming a real
+// document through Express would fail in production on anything but a tiny file.
+// 10MB ceiling: the completion email attaches the signed PDF + evidence and base64
+// inflates ~37%, so a larger upload produces a message mail servers reject — after the
+// document is already signed.
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const EVENT_RENDER_CAP = 500;
+
+// Recorded verbatim into the audit trail so the evidence package shows exactly what the
+// signer agreed to. Bump the version if the wording ever changes.
+const CONSENT_VERSION = '1.0';
+const CONSENT_STATEMENT =
+  'I agree to use electronic records and signatures for this document, and I intend my ' +
+  'electronic signature to be as legally binding as a handwritten one.';
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+
+// Short, non-reversible handle for a signing token — safe to write into the audit log.
+const tokenFingerprint = (token) => sha256(Buffer.from(token)).slice(0, 12);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // --- Sender auth (env-gated: enforced only when SENDER_PASSWORD is set) ---
 const SENDER_PASSWORD = process.env.SENDER_PASSWORD || null;
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+// Fail closed. Without this, a missing/failed secret lookup in production silently
+// disables sender auth and publishes an open upload + SES relay on a verified domain.
+if (!process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET is required');
+}
+if (IS_PROD && !SENDER_PASSWORD) {
+  throw new Error('SENDER_PASSWORD is required when NODE_ENV=production (refusing to start with auth disabled)');
+}
 
 function requireSender(req, res, next) {
   if (!SENDER_PASSWORD) return next(); // auth disabled in dev
@@ -37,28 +84,115 @@ function requireSender(req, res, next) {
 }
 
 app.get('/auth/status', (_req, res) => res.json({ authRequired: !!SENDER_PASSWORD }));
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', rateLimit({ max: 10, windowSeconds: 900, name: 'login' }), async (req, res) => {
   if (!SENDER_PASSWORD) return res.json({ token: null, authRequired: false });
-  if (req.body?.password !== SENDER_PASSWORD) return res.status(401).json({ error: 'invalid password' });
+  const supplied = String(req.body?.password ?? '');
+  // Constant-time compare over equal-length digests — a direct !== leaks the shared
+  // prefix length through timing.
+  const ok = crypto.timingSafeEqual(
+    crypto.createHash('sha256').update(supplied).digest(),
+    crypto.createHash('sha256').update(SENDER_PASSWORD).digest(),
+  );
+  if (!ok) return res.status(401).json({ error: 'invalid password' });
   const token = jwt.sign({ role: 'sender' }, process.env.JWT_SECRET, { expiresIn: '12h' });
   res.json({ token });
 });
 
-// 1. Upload PDF
-app.post('/documents', requireSender, upload.single('file'), async (req, res) => {
+// --- Rate limiting -----------------------------------------------------------
+// DynamoDB atomic counter rather than AWS WAF: a WAF web ACL costs $5/mo, which is more
+// than the entire rest of this system. Windowed counters are TTL'd away automatically.
+function rateLimit({ max, windowSeconds, name }) {
+  return async (req, res, next) => {
+    try {
+      const n = await repo.bumpRateLimit(`${name}#${clientIp(req) || 'unknown'}`, windowSeconds);
+      if (n > max) {
+        res.setHeader('Retry-After', String(windowSeconds));
+        return res.status(429).json({ error: 'too many requests' });
+      }
+    } catch (e) {
+      console.error('rate limiter unavailable, allowing request:', e.message);
+    }
+    next();
+  };
+}
+
+const SIGNING_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Resolve an opaque signing token and bind it to the document's *current* state.
+ *
+ * Opaque + DB-backed rather than a JWT: a JWT can't be revoked, so a leaked link stayed
+ * live for its full 7 days with no way to kill it. Expiry is checked HERE, in code —
+ * DynamoDB TTL is best-effort garbage collection and can lag for hours, so it is never
+ * the security boundary.
+ *
+ * The nonce comparison is what kills superseded links: re-sending rotates the document's
+ * nonce, so every previously issued token stops resolving.
+ */
+async function resolveSigningToken(token, { consistent = false } = {}) {
+  const rec = await repo.getToken(token);
+  if (!rec) throw Object.assign(new Error('invalid or expired link'), { status: 401 });
+  if (Date.now() > rec.expiresAt) throw Object.assign(new Error('this signing link has expired'), { status: 401 });
+
+  const doc = await repo.getDocument(rec.docId, { consistent });
+  if (!doc) throw Object.assign(new Error('not found'), { status: 404 });
+  if (doc.signerEmail !== rec.signerEmail || doc.tokenNonce !== rec.nonce) {
+    throw Object.assign(new Error('this signing link has been superseded'), { status: 401 });
+  }
+  return { payload: { doc_id: rec.docId, signer: rec.signerEmail }, doc };
+}
+
+// Wire shape the frontend expects (snake_case sort_order), minus internal keys.
+const wireField = (f) => ({
+  id: f.id, type: f.type, page: f.page,
+  x: f.x, y: f.y, w: f.w, h: f.h,
+  required: f.required, sort_order: f.sortOrder,
+});
+
+// 1a. Mint a direct-to-S3 upload URL. Writes nothing — an abandoned upload leaves an
+// orphan object (swept by lifecycle rules), not a phantom document record.
+app.post('/documents/init', requireSender, async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'file required' });
-    if (req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'pdf only' });
+    const filename = String(req.body?.filename || '').trim();
+    if (!filename) return res.status(400).json({ error: 'filename required' });
+    if (!/\.pdf$/i.test(filename)) return res.status(400).json({ error: 'pdf only' });
     const id = crypto.randomUUID();
-    const hash = sha256(req.file.buffer);
     const key = `documents/${id}/original.pdf`;
-    await putObject(key, req.file.buffer, 'application/pdf');
-    await pool.query(
-      `INSERT INTO documents (id, filename, original_hash, s3_key_original, sender_email) VALUES ($1,$2,$3,$4,$5)`,
-      [id, req.file.originalname, hash, key, req.body.sender_email || null]
-    );
-    await logEvent(id, 'document_uploaded', req, { filename: req.file.originalname, size: req.file.size, hash });
-    res.json({ id, hash, filename: req.file.originalname });
+    res.json({ id, key, uploadUrl: await presignPut(key), maxBytes: MAX_UPLOAD_BYTES });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 1b. Register the uploaded object. The hash is computed HERE, from the bytes actually in
+// S3 — never taken from the client, since it's the document's integrity anchor.
+app.post('/documents/:id/complete', requireSender, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: 'bad id' });
+    const filename = String(req.body?.filename || '').trim();
+    if (!filename) return res.status(400).json({ error: 'filename required' });
+
+    const key = `documents/${id}/original.pdf`;
+    const head = await headObject(key);
+    if (!head) return res.status(400).json({ error: 'upload not found — PUT the file first' });
+    if (head.size > MAX_UPLOAD_BYTES) return res.status(400).json({ error: 'file too large (max 10MB)' });
+
+    const buf = await getObject(key);
+    // Trust the bytes, not the declared content type — a presigned PUT lets the client
+    // claim any Content-Type it likes.
+    if (buf.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      return res.status(400).json({ error: 'not a PDF' });
+    }
+    const hash = sha256(buf);
+
+    await repo.createDocument({
+      id, filename, originalHash: hash,
+      s3KeyOriginal: key, senderEmail: req.body.sender_email || null,
+    });
+    await logEvent(id, 'document_uploaded', req, { filename, size: head.size, hash });
+    res.json({ id, hash, filename });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -71,17 +205,37 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     const { id } = req.params;
     const { signer_email } = req.body;
     if (!signer_email) return res.status(400).json({ error: 'signer_email required' });
-    const { rows } = await pool.query(`SELECT * FROM documents WHERE id=$1`, [id]);
-    if (!rows.length) return res.status(404).json({ error: 'not found' });
-    const token = jwt.sign({ doc_id: id, signer: signer_email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    await pool.query(`UPDATE documents SET signer_email=$1, status='sent' WHERE id=$2`, [signer_email, id]);
-    const link = `${process.env.APP_BASE_URL}/sign/${token}`;
+    const doc = await repo.getDocument(id);
+    if (!doc) return res.status(404).json({ error: 'not found' });
+
+    // New nonce per send → every previously issued link for this document stops working.
+    const nonce = crypto.randomBytes(9).toString('base64url');
+    // An executed document is final — re-sending would reset it to 'sent' and allow
+    // the signed contract to be signed again over the top of itself.
+    const updated = await repo.markSent({ id, signerEmail: signer_email, tokenNonce: nonce });
+    if (!updated) return res.status(409).json({ error: 'already signed' });
+
+    // 128 bits of opaque randomness — short enough for a clean link, revocable, and
+    // carrying no readable claims.
+    const token = crypto.randomBytes(16).toString('base64url');
+    await repo.putToken({
+      token, docId: id, signerEmail: signer_email, nonce,
+      expiresAt: Date.now() + SIGNING_TOKEN_TTL_MS,
+    });
+    const link = `${process.env.APP_BASE_URL}/s/${token}`;
     await sendEmail({
       to: signer_email,
-      subject: `Signature requested: ${rows[0].filename}`,
-      html: `<p>You have a document to sign.</p><p><a href="${link}">Open and sign</a></p>`
+      ...signatureRequestEmail({
+        senderName: process.env.SENDER_NAME || null,
+        senderEmail: doc.senderEmail || process.env.SES_FROM || null,
+        filename: doc.filename,
+        link,
+        expiresDays: 7,
+      }),
     });
-    await logEvent(id, 'link_sent', req, { signer_email, link });
+    // Never log the link itself — event metadata is printed verbatim into the evidence
+    // PDF that goes to both parties, which would publish a live credential.
+    await logEvent(id, 'link_sent', req, { signer_email, token_fp: tokenFingerprint(token) });
     res.json({ ok: true, link });
   } catch (e) {
     console.error(e);
@@ -90,18 +244,17 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
 });
 
 // --- Sender-side: view PDF + place fields (Prepare step) ---
-// NOTE: no sender auth yet (localhost only) — Phase 4 adds it before public exposure.
+// All routes below are behind requireSender (enforced whenever SENDER_PASSWORD is set,
+// and mandatory under NODE_ENV=production — see the startup guard above).
 
 const FIELD_TYPES = new Set(['signature', 'initials', 'date', 'name', 'text', 'checkbox']);
 
-// Stream the original PDF for the sender's Prepare page
+// Presigned URL for the original PDF (sender's Prepare page). Returns {url}, not bytes.
 app.get('/documents/:id/pdf', requireSender, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT s3_key_original FROM documents WHERE id=$1`, [req.params.id]);
-    if (!rows.length) return res.status(404).end();
-    const buf = await getObject(rows[0].s3_key_original);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.send(buf);
+    const doc = await repo.getDocument(req.params.id);
+    if (!doc) return res.status(404).json({ error: 'not found' });
+    res.json({ url: await presignGet(doc.s3KeyOriginal) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -111,11 +264,8 @@ app.get('/documents/:id/pdf', requireSender, async (req, res) => {
 // List placed fields for a document
 app.get('/documents/:id/fields', requireSender, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, type, page, x, y, w, h, required, sort_order FROM fields WHERE doc_id=$1 ORDER BY sort_order ASC`,
-      [req.params.id]
-    );
-    res.json({ fields: rows });
+    const fields = await repo.listFields(req.params.id);
+    res.json({ fields: fields.map(wireField) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -128,11 +278,14 @@ app.put('/documents/:id/fields', requireSender, async (req, res) => {
   const incoming = Array.isArray(req.body?.fields) ? req.body.fields : null;
   if (!incoming) return res.status(400).json({ error: 'fields array required' });
 
-  const client = await pool.connect();
   try {
-    const doc = await client.query(`SELECT id, status FROM documents WHERE id=$1`, [id]);
-    if (!doc.rows.length) return res.status(404).json({ error: 'not found' });
-    if (doc.rows[0].status === 'signed') return res.status(409).json({ error: 'already signed' });
+    const doc = await repo.getDocument(id, { consistent: true });
+    if (!doc) return res.status(404).json({ error: 'not found' });
+    // 'signing' means a submit is mid-flight against the current field set — moving the
+    // fields underneath it would flatten values at coordinates the signer never saw.
+    if (['signed', 'signing'].includes(doc.status)) {
+      return res.status(409).json({ error: `cannot edit fields while status=${doc.status}` });
+    }
 
     // Validate before touching anything
     const clean = incoming.map((f, i) => {
@@ -148,98 +301,82 @@ app.put('/documents/:id/fields', requireSender, async (req, res) => {
       };
     });
 
-    await client.query('BEGIN');
-    await client.query(`DELETE FROM fields WHERE doc_id=$1`, [id]);
-    for (const f of clean) {
-      await client.query(
-        `INSERT INTO fields (doc_id, type, page, x, y, w, h, required, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [id, f.type, f.page, f.x, f.y, f.w, f.h, f.required, f.sort_order]
-      );
-    }
-    await client.query('COMMIT');
+    await repo.replaceFields(id, clean);
     await logEvent(id, 'fields_placed', req, { count: clean.length, types: clean.map(f => f.type) });
     res.json({ ok: true, count: clean.length });
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
     console.error(e);
     res.status(400).json({ error: e.message });
-  } finally {
-    client.release();
   }
 });
 
 // 3. Open signing link (signer side)
-app.get('/sign/:token', async (req, res) => {
+app.get('/sign/:token', signerLimit(), async (req, res) => {
   try {
-    const payload = jwt.verify(req.params.token, process.env.JWT_SECRET);
-    const { rows } = await pool.query(`SELECT id, filename, status FROM documents WHERE id=$1`, [payload.doc_id]);
-    if (!rows.length) return res.status(404).json({ error: 'not found' });
-    if (rows[0].status === 'signed') return res.status(410).json({ error: 'already signed' });
-    const fieldsRes = await pool.query(
-      `SELECT id, type, page, x, y, w, h, required, sort_order FROM fields WHERE doc_id=$1 ORDER BY sort_order ASC`,
-      [payload.doc_id]
-    );
+    const { payload, doc } = await resolveSigningToken(req.params.token);
+    if (doc.status === 'signed') return res.status(410).json({ error: 'already signed' });
+    const fields = await repo.listFields(payload.doc_id);
     await logEvent(payload.doc_id, 'link_opened', req, { signer: payload.signer });
-    res.json({ doc_id: payload.doc_id, filename: rows[0].filename, signer: payload.signer, fields: fieldsRes.rows });
+    res.json({
+      doc_id: payload.doc_id, filename: doc.filename, signer: payload.signer,
+      fields: fields.map(wireField),
+      consent: { version: CONSENT_VERSION, statement: CONSENT_STATEMENT },
+    });
   } catch (e) {
-    res.status(401).json({ error: 'invalid or expired token' });
+    res.status(e.status || 401).json({ error: e.status ? e.message : 'invalid or expired token' });
   }
 });
 
-// Stream the original PDF for the signer to view
-app.get('/sign/:token/pdf', async (req, res) => {
+// Presigned URL for the original PDF (signer's view)
+app.get('/sign/:token/pdf', signerLimit(), async (req, res) => {
   try {
-    const payload = jwt.verify(req.params.token, process.env.JWT_SECRET);
-    const { rows } = await pool.query(`SELECT s3_key_original FROM documents WHERE id=$1`, [payload.doc_id]);
-    if (!rows.length) return res.status(404).end();
-    const buf = await getObject(rows[0].s3_key_original);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.send(buf);
+    const { doc } = await resolveSigningToken(req.params.token);
+    res.json({ url: await presignGet(doc.s3KeyOriginal) });
   } catch (e) {
-    res.status(401).json({ error: 'invalid token' });
+    res.status(e.status || 401).json({ error: e.status ? e.message : 'invalid token' });
   }
 });
 
 // Post-sign downloads for the signer (token stays valid for the 7d window)
-app.get('/sign/:token/signed', async (req, res) => {
+app.get('/sign/:token/signed', signerLimit(), async (req, res) => {
   try {
-    const payload = jwt.verify(req.params.token, process.env.JWT_SECRET);
-    const { rows } = await pool.query(`SELECT s3_key_signed, filename FROM documents WHERE id=$1`, [payload.doc_id]);
-    if (!rows.length || !rows[0].s3_key_signed) return res.status(404).json({ error: 'not signed yet' });
-    const buf = await getObject(rows[0].s3_key_signed);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="signed-${rows[0].filename}"`);
-    res.send(buf);
+    const { doc } = await resolveSigningToken(req.params.token, { consistent: true });
+    if (!doc.s3KeySigned) return res.status(404).json({ error: 'not signed yet' });
+    res.json({ url: await presignGet(doc.s3KeySigned, `signed-${doc.filename}`) });
   } catch (e) {
-    res.status(401).json({ error: 'invalid token' });
+    res.status(e.status || 401).json({ error: e.status ? e.message : 'invalid token' });
   }
 });
 
-app.get('/sign/:token/evidence', async (req, res) => {
+app.get('/sign/:token/evidence', signerLimit(), async (req, res) => {
   try {
-    const payload = jwt.verify(req.params.token, process.env.JWT_SECRET);
-    const buf = await buildEvidencePdf(payload.doc_id);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename="evidence.pdf"');
-    res.send(buf);
+    const { payload } = await resolveSigningToken(req.params.token, { consistent: true });
+    const key = await ensureEvidence(payload.doc_id);
+    res.json({ url: await presignGet(key, 'evidence.pdf') });
   } catch (e) {
-    res.status(401).json({ error: 'invalid token' });
+    res.status(e.status || 401).json({ error: e.status ? e.message : 'invalid token' });
   }
 });
 
 // 4. Submit — apply values to all placed fields, flatten, email
-app.post('/sign/:token', async (req, res) => {
+app.post('/sign/:token', signerLimit(), async (req, res) => {
+  let claimedDocId = null;
   try {
-    const payload = jwt.verify(req.params.token, process.env.JWT_SECRET);
+    // Strongly consistent: an eventually-consistent read can serve a stale 'sent' status
+    // for a document that was just executed.
+    const { payload, doc } = await resolveSigningToken(req.params.token, { consistent: true });
     const values = req.body?.values && typeof req.body.values === 'object' ? req.body.values : {};
 
-    const { rows } = await pool.query(`SELECT * FROM documents WHERE id=$1`, [payload.doc_id]);
-    if (!rows.length) return res.status(404).json({ error: 'not found' });
-    if (rows[0].status === 'signed') return res.status(410).json({ error: 'already signed' });
+    if (doc.status === 'signed') return res.status(410).json({ error: 'already signed' });
 
-    const fieldsRes = await pool.query(`SELECT * FROM fields WHERE doc_id=$1 ORDER BY sort_order ASC`, [payload.doc_id]);
-    const fields = fieldsRes.rows;
+    // ESIGN Act §101(c) / UETA: an electronic signature is only enforceable if the signer
+    // affirmatively consented to transact electronically and intended to be bound. Refusing
+    // without it is the point — "they clicked a button" is not a defensible record.
+    if (req.body?.consent !== true) {
+      return res.status(400).json({ error: 'electronic signature consent is required' });
+    }
+
+    const fields = await repo.listFields(payload.doc_id, { consistent: true });
     if (!fields.length) return res.status(400).json({ error: 'document has no fields to sign' });
 
     // Validate: every required field must have a non-empty value
@@ -251,12 +388,26 @@ app.post('/sign/:token', async (req, res) => {
     const missing = fields.filter(f => f.required && !isFilled(f));
     if (missing.length) return res.status(400).json({ error: `missing required fields: ${missing.map(m => m.type).join(', ')}` });
 
+    // Claim before doing any work. Validation runs first so a rejected submit never
+    // locks the document.
+    const claimed = await repo.claimForSigning(payload.doc_id);
+    if (!claimed) return res.status(410).json({ error: 'already signed or in progress' });
+    claimedDocId = payload.doc_id;
+
+    // Recorded before the signature itself so the evidence package shows consent
+    // preceding execution.
+    await logEvent(payload.doc_id, 'consent_given', req, {
+      signer: payload.signer,
+      disclosure_version: CONSENT_VERSION,
+      statement: CONSENT_STATEMENT,
+    });
+
     await logEvent(payload.doc_id, 'signature_drawn', req, {
       signer: payload.signer, filled: fields.filter(isFilled).map(f => ({ type: f.type, page: f.page })),
     });
 
     // Flatten every filled field onto the PDF
-    const originalBuf = await getObject(rows[0].s3_key_original);
+    const originalBuf = await getObject(doc.s3KeyOriginal);
     const pdfDoc = await PDFDocument.load(originalBuf);
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
     const pages = pdfDoc.getPages();
@@ -294,65 +445,118 @@ app.post('/sign/:token', async (req, res) => {
       x: 24, y: 14, size: 6.5, font, color: rgb(0.45, 0.45, 0.45),
     });
 
-    // Persist field values (redact signature images to avoid DB bloat)
-    for (const f of fields) {
-      if (!isFilled(f)) continue;
-      const stored = (f.type === 'signature' || f.type === 'initials') ? { image: true } : values[f.id];
-      await pool.query(`UPDATE fields SET value=$1 WHERE id=$2`, [JSON.stringify(stored), f.id]);
-    }
+    // Persist field values (redact signature images — the PNG lives in the flattened PDF)
+    await repo.setFieldValues(payload.doc_id, fields.filter(isFilled).map(f => ({
+      sk: f.SK,
+      value: (f.type === 'signature' || f.type === 'initials') ? { image: true } : values[f.id],
+    })));
 
     const signedBytes = await pdfDoc.save();
     const signedHash = sha256(Buffer.from(signedBytes));
     const signedKey = `documents/${payload.doc_id}/signed.pdf`;
     await putObject(signedKey, Buffer.from(signedBytes), 'application/pdf');
 
-    await pool.query(
-      `UPDATE documents SET signed_hash=$1, s3_key_signed=$2, status='signed' WHERE id=$3`,
-      [signedHash, signedKey, payload.doc_id]
-    );
+    await repo.commitSigned({ id: payload.doc_id, signedHash, s3KeySigned: signedKey });
+    claimedDocId = null; // committed — nothing to roll back
     await logEvent(payload.doc_id, 'document_signed', req, { signer: payload.signer, signed_hash: signedHash });
 
-    // Email both parties
-    const doc = rows[0];
-    const signedBuffer = Buffer.from(signedBytes);
-    const evidenceBuffer = await buildEvidencePdf(payload.doc_id);
-    const recipients = [doc.signer_email, doc.sender_email].filter(Boolean);
-    for (const to of recipients) {
+    // Deliver BEFORE responding, and swallow failures.
+    //
+    // This must be awaited: Lambda freezes the execution environment the instant the
+    // handler returns, so fire-and-forget work scheduled after res.json() silently never
+    // runs. That shipped once — a document was signed and committed and neither party was
+    // ever emailed, with no error anywhere to show for it.
+    //
+    // Errors are caught rather than thrown because the signature is already committed at
+    // this point; a delivery failure must never surface to the signer as a signing
+    // failure. deliverCompletion() records its own success/failure events.
+    await deliverCompletion({ doc, signedHash, signedBytes, req })
+      .catch(err => console.error('completion delivery failed:', err));
+
+    res.json({ ok: true, signed_hash: signedHash });
+  } catch (e) {
+    // A failure after the claim would otherwise strand the document in 'signing',
+    // locking out the signer permanently.
+    if (claimedDocId) {
+      await repo.releaseClaim(claimedDocId).catch(err => console.error('failed to release signing claim:', err));
+    }
+    console.error(e);
+    if (res.headersSent) return;
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// Completion delivery runs outside the request path on purpose. The signature is already
+// committed by the time this runs, so a bounced or throttled email must not surface to the
+// signer as a signing failure — that drove a retry which then 410s, leaving them with an
+// executed contract and no copy of it. Failures are logged as events instead.
+async function deliverCompletion({ doc, signedHash, signedBytes, req }) {
+  const recipients = [doc.signerEmail, doc.senderEmail].filter(Boolean);
+  if (!recipients.length) return;
+
+  const signedBuffer = Buffer.from(signedBytes);
+  const evidenceBuffer = await buildEvidencePdf(doc.id);
+  const delivered = [], failed = [];
+
+  const content = completionEmail({
+    filename: doc.filename,
+    signerEmail: doc.signerEmail,
+    originalHash: doc.originalHash,
+    signedHash,
+    signedAt: new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
+  });
+
+  for (const to of recipients) {
+    try {
       await sendEmail({
         to,
-        subject: `Signed: ${doc.filename}`,
-        html: `<p>The document has been signed.</p><p>Original hash: ${doc.original_hash}<br/>Signed hash: ${signedHash}</p>`,
+        ...content,
         attachments: [
           { filename: doc.filename, content: signedBuffer },
           { filename: 'evidence.pdf', content: evidenceBuffer }
         ]
       });
+      delivered.push(to);
+    } catch (err) {
+      // Isolated per recipient — a bad signer address must not cost the sender their copy.
+      console.error(`completion email to ${to} failed:`, err);
+      failed.push({ to, error: err.message });
     }
-    await logEvent(payload.doc_id, 'completion_emailed', req, { recipients });
-
-    res.json({ ok: true, signed_hash: signedHash });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
   }
-});
+
+  if (delivered.length) await logEvent(doc.id, 'completion_emailed', req, { recipients: delivered });
+  if (failed.length) await logEvent(doc.id, 'completion_email_failed', req, { failures: failed });
+}
 
 // 5. Evidence package
 app.get('/documents/:id/evidence', requireSender, async (req, res) => {
   try {
-    const buf = await buildEvidencePdf(req.params.id);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.send(buf);
+    const key = await ensureEvidence(req.params.id);
+    res.json({ url: await presignGet(key, 'evidence.pdf') });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+/**
+ * Render the evidence package to S3 and return its key. Always regenerated: the event log
+ * grows after signing (downloads, re-opens), and a stale cached copy would understate the
+ * audit trail. Kept out of the HTTP response body because a long log can exceed Lambda's
+ * 6MB response cap.
+ */
+async function ensureEvidence(docId) {
+  const buf = await buildEvidencePdf(docId);
+  const key = `documents/${docId}/evidence.pdf`;
+  await putObject(key, buf, 'application/pdf');
+  return key;
+}
+
 async function buildEvidencePdf(docId) {
-  const docRes = await pool.query(`SELECT * FROM documents WHERE id=$1`, [docId]);
-  const evRes = await pool.query(`SELECT * FROM events WHERE doc_id=$1 ORDER BY created_at ASC`, [docId]);
-  const fieldsRes = await pool.query(`SELECT type, page, required, value FROM fields WHERE doc_id=$1 ORDER BY sort_order ASC`, [docId]);
-  const doc = docRes.rows[0];
+  const [doc, events, fields] = await Promise.all([
+    repo.getDocument(docId, { consistent: true }),
+    repo.listEvents(docId),
+    repo.listFields(docId, { consistent: true }),
+  ]);
   if (!doc) throw new Error('not found');
 
   return await new Promise((resolve, reject) => {
@@ -367,17 +571,17 @@ async function buildEvidencePdf(docId) {
     pdf.fontSize(10);
     pdf.text(`Document ID: ${doc.id}`);
     pdf.text(`Filename: ${doc.filename}`);
-    pdf.text(`Sender: ${doc.sender_email || '(unknown)'}`);
-    pdf.text(`Signer: ${doc.signer_email || '(unknown)'}`);
+    pdf.text(`Sender: ${doc.senderEmail || '(unknown)'}`);
+    pdf.text(`Signer: ${doc.signerEmail || '(unknown)'}`);
     pdf.text(`Status: ${doc.status}`);
-    pdf.text(`Original SHA-256: ${doc.original_hash}`);
-    pdf.text(`Signed SHA-256:   ${doc.signed_hash || '(unsigned)'}`);
+    pdf.text(`Original SHA-256: ${doc.originalHash}`);
+    pdf.text(`Signed SHA-256:   ${doc.signedHash || '(unsigned)'}`);
 
     pdf.moveDown();
     pdf.fontSize(14).text('Completed Fields');
     pdf.fontSize(9);
-    if (!fieldsRes.rows.length) pdf.text('   (none)');
-    for (const f of fieldsRes.rows) {
+    if (!fields.length) pdf.text('   (none)');
+    for (const f of fields) {
       const val = f.value == null ? '(empty)'
         : (f.value.image ? '[signature image]' : JSON.stringify(f.value));
       pdf.text(`   ${f.type} (page ${f.page + 1}${f.required ? ', required' : ''}): ${val}`);
@@ -386,10 +590,18 @@ async function buildEvidencePdf(docId) {
     pdf.moveDown();
     pdf.fontSize(14).text('Event Log');
     pdf.fontSize(9);
-    for (const e of evRes.rows) {
+    // `link_opened` fires on every page refresh, so the log has no natural ceiling.
+    // Render the most recent EVENT_RENDER_CAP and say so, rather than emit an unbounded PDF.
+    const shown = events.length > EVENT_RENDER_CAP ? events.slice(-EVENT_RENDER_CAP) : events;
+    if (shown.length < events.length) {
+      pdf.fillColor('#b45309')
+         .text(`   (showing the most recent ${shown.length} of ${events.length} events)`)
+         .fillColor('black');
+    }
+    for (const e of shown) {
       pdf.moveDown(0.5);
-      pdf.text(`[${e.created_at.toISOString()}] ${e.type}`);
-      pdf.text(`   ip=${e.ip || '-'}  ua=${(e.user_agent || '').slice(0, 80)}`);
+      pdf.text(`[${e.createdAt}] ${e.type}`);
+      pdf.text(`   ip=${e.ip || '-'}  ua=${(e.userAgent || '').slice(0, 80)}`);
       if (e.metadata && Object.keys(e.metadata).length) {
         pdf.text(`   meta=${JSON.stringify(e.metadata)}`, { width: 500 });
       }
@@ -398,5 +610,12 @@ async function buildEvidencePdf(docId) {
   });
 }
 
-const port = process.env.PORT || 4000;
-app.listen(port, () => console.log(`esign backend listening on :${port}`));
+// buildEvidencePdf/deliverCompletion are exported for operational re-sends (re-delivering
+// a completion for an already-signed document) — not used by the request path.
+export { app, buildEvidencePdf, deliverCompletion };
+
+// Only bind a port when run directly. Under Lambda the app is wrapped by handler.js.
+if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  const port = process.env.PORT || 4000;
+  app.listen(port, () => console.log(`esign backend listening on :${port}`));
+}
