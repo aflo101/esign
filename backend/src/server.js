@@ -83,7 +83,21 @@ function requireSender(req, res, next) {
   }
 }
 
-app.get('/auth/status', (_req, res) => res.json({ authRequired: !!SENDER_PASSWORD }));
+// Reports whether the caller's bearer is actually USABLE, not just present. The UI gate
+// previously opened on the mere existence of a token in localStorage, so an expired or
+// invalid one left the app rendered with no working credential — every action 401'd and
+// the password prompt never appeared.
+app.get('/auth/status', (req, res) => {
+  let authenticated = false;
+  if (SENDER_PASSWORD) {
+    const h = req.headers.authorization || '';
+    const t = h.startsWith('Bearer ') ? h.slice(7) : null;
+    try {
+      authenticated = jwt.verify(t, process.env.JWT_SECRET).role === 'sender';
+    } catch { authenticated = false; }
+  }
+  res.json({ authRequired: !!SENDER_PASSWORD, authenticated });
+});
 app.post('/auth/login', rateLimit({ max: 10, windowSeconds: 900, name: 'login' }), async (req, res) => {
   if (!SENDER_PASSWORD) return res.json({ token: null, authRequired: false });
   const supplied = String(req.body?.password ?? '');

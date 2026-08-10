@@ -9,8 +9,24 @@ export function authHeaders(extra = {}) {
   return t ? { ...extra, Authorization: `Bearer ${t}` } : extra
 }
 
+// Sends the bearer so the server can report whether it's still valid, not just present.
 export async function authStatus() {
-  return fetch('/api/auth/status').then(r => r.json())
+  return fetch('/api/auth/status', { headers: authHeaders() }).then(r => r.json())
+}
+
+/**
+ * fetch wrapper for sender-only calls. A 401 means the stored token is dead — drop it and
+ * reload so the gate re-locks and prompts, instead of leaving the app rendered in a state
+ * where every action fails with "sender auth required" and there's no way to sign back in.
+ */
+export async function senderFetch(url, opts = {}) {
+  const res = await fetch(url, { ...opts, headers: authHeaders(opts.headers || {}) })
+  if (res.status === 401) {
+    setToken(null)
+    window.location.reload()
+    throw new Error('session expired — please sign in again')
+  }
+  return res
 }
 
 export async function login(password) {
