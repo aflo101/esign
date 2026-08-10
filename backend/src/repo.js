@@ -32,11 +32,35 @@ const db = () => (docClient ||= DynamoDBDocumentClient.from(
 
 const docPk = (id) => `DOC#${id}`;
 const pad = (n, w) => String(n).padStart(w, '0');
-const FIELD_LIMIT = 100; // keeps replaceFields inside one TransactWriteItems call
 
+// 50, not 100: replaceFields transacts deletes of the OLD set plus puts of the NEW set,
+// and TransactWriteItems caps at 100 total operations. A limit of 100 fields let the
+// FIRST save succeed (100 puts) and then made every subsequent edit throw (100 deletes
+// + 100 puts = 200), permanently locking the document's fields.
+const FIELD_LIMIT = 50;
+
+// Per-container tiebreaker for events written in the same millisecond by the SAME warm
+// container. It resets on cold start and is not unique across containers — cross-container
+// ordering is authoritative only to the millisecond, with the random suffix breaking ties
+// arbitrarily. 8 random bytes so a cross-container same-millisecond collision (which would
+// silently overwrite an audit event) is out of reach; putEvent also refuses to overwrite.
 let evtSeq = 0;
 const eventSk = () =>
-  `EVT#${pad(Date.now(), 13)}#${pad(++evtSeq % 1e6, 6)}#${crypto.randomBytes(3).toString('hex')}`;
+  `EVT#${pad(Date.now(), 13)}#${pad(++evtSeq % 1e6, 6)}#${crypto.randomBytes(8).toString('hex')}`;
+
+// DynamoDB caps a Query response at 1MB and silently pages past it. A single call
+// truncates the NEWEST items — for events that means consent_given / document_signed,
+// the exact records the evidence package exists to preserve. Always drain the cursor.
+async function queryAll(input) {
+  const items = [];
+  let ExclusiveStartKey;
+  do {
+    const out = await db().send(new QueryCommand({ ...input, ExclusiveStartKey }));
+    items.push(...(out.Items ?? []));
+    ExclusiveStartKey = out.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return items;
+}
 
 const isConditionFailure = (e) =>
   e?.name === 'ConditionalCheckFailedException' ||
@@ -139,13 +163,12 @@ export async function commitSigned({ id, signedHash, s3KeySigned }) {
 // --- fields ------------------------------------------------------------------
 
 export async function listFields(docId, { consistent = false } = {}) {
-  const { Items = [] } = await db().send(new QueryCommand({
+  return queryAll({
     TableName: TABLE,
     KeyConditionExpression: 'PK = :pk AND begins_with(SK, :p)',
     ExpressionAttributeValues: { ':pk': docPk(docId), ':p': 'FLD#' },
     ConsistentRead: consistent,
-  }));
-  return Items; // already in sortOrder — SK embeds it fixed-width
+  }); // already in sortOrder — SK embeds it fixed-width
 }
 
 /**
@@ -173,7 +196,9 @@ export async function replaceFields(docId, fields) {
     ...existing.map(e => ({ Delete: { TableName: TABLE, Key: { PK: e.PK, SK: e.SK } } })),
     ...items.map(Item => ({ Put: { TableName: TABLE, Item } })),
   ];
-  if (ops.length > FIELD_LIMIT) throw new Error('field replacement exceeds transaction limit');
+  // TransactWriteItems hard cap. FIELD_LIMIT=50 guarantees deletes+puts fit; this is the
+  // backstop in case a legacy document somehow carries more stored fields than the limit.
+  if (ops.length > 100) throw new Error('field replacement exceeds transaction limit');
   if (ops.length) await db().send(new TransactWriteCommand({ TransactItems: ops }));
   return items;
 }
@@ -196,23 +221,33 @@ export async function setFieldValues(docId, entries) {
 // --- events ------------------------------------------------------------------
 
 export async function putEvent(docId, { type, actor, ip, userAgent, metadata }) {
-  await db().send(new PutCommand({
-    TableName: TABLE,
-    Item: {
-      PK: docPk(docId), SK: eventSk(), entity: 'event',
-      type, actor: actor || null, ip: ip || null, userAgent: userAgent || null,
-      metadata: metadata || {}, createdAt: new Date().toISOString(),
-    },
-  }));
+  // Append-only is enforced, not assumed: the condition makes an SK collision (two
+  // containers, same millisecond, same random suffix) throw instead of silently
+  // overwriting an audit event. On that astronomically rare throw, retry with a new SK.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await db().send(new PutCommand({
+        TableName: TABLE,
+        Item: {
+          PK: docPk(docId), SK: eventSk(), entity: 'event',
+          type, actor: actor || null, ip: ip || null, userAgent: userAgent || null,
+          metadata: metadata || {}, createdAt: new Date().toISOString(),
+        },
+        ConditionExpression: 'attribute_not_exists(PK)',
+      }));
+    } catch (e) {
+      if (e?.name === 'ConditionalCheckFailedException' && attempt < 3) continue;
+      throw e;
+    }
+  }
 }
 
 export async function listEvents(docId) {
-  const { Items = [] } = await db().send(new QueryCommand({
+  return queryAll({
     TableName: TABLE,
     KeyConditionExpression: 'PK = :pk AND begins_with(SK, :p)',
     ExpressionAttributeValues: { ':pk': docPk(docId), ':p': 'EVT#' },
-  }));
-  return Items; // chronological — SK embeds fixed-width millis + counter
+  }); // chronological — SK embeds fixed-width millis + counter
 }
 
 // --- signing tokens (opaque, revocable, TTL'd) --------------------------------

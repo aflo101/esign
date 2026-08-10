@@ -46,8 +46,10 @@ only ever moves JSON.
 
 ## Data model
 
-One DynamoDB table. One partition per document, so a single Query returns the document,
-every placed field, and the full audit trail in one round trip.
+One DynamoDB table. One partition per document — the layout *supports* fetching the
+document, its fields, and the audit trail in a single Query, though the code reads each
+prefix separately (three cheap Queries on the same partition), each one fully paginated
+past DynamoDB's 1MB page cap.
 
 | PK | SK | Item |
 |---|---|---|
@@ -84,11 +86,20 @@ evidence package.
   `SENDER_PASSWORD` when `NODE_ENV=production`.
 - **The signing link is never logged.** Event metadata is printed verbatim into the evidence
   PDF sent to both parties; a 12-char fingerprint is recorded instead.
-- **Audit IPs come from `CloudFront-Viewer-Address`**, not the first `x-forwarded-for` entry
-  — CloudFront *appends*, so the first entry is attacker-controlled and these values end up
-  in a legal document.
+- **Audit IPs come from `CloudFront-Viewer-Address`**, forwarded by an explicit allowlist
+  origin-request policy (CloudFront-generated headers only reach the origin when listed —
+  no managed all-viewer policy carries this one). Fallback is the *last* `x-forwarded-for`
+  entry, which CloudFront appends and a client cannot control; the first entry is
+  attacker-chosen and is never used. These values end up in a legal document.
 - **ESIGN Act / UETA consent** is captured before signing and recorded as a `consent_given`
   event that appears in the evidence package.
+- **The evidence package cannot lose the signing events.** `listEvents` drains the full
+  Query cursor, and under log-flooding pressure the renderer summarizes `link_opened`
+  (count + first/last) and keeps both ends of the timeline rather than a most-recent
+  window that a flooded log could push `document_signed` out of.
+- **Append-only is enforced** — event writes are conditional (`attribute_not_exists`), so
+  an SK collision throws and retries with a fresh key instead of silently overwriting an
+  audit record.
 
 ---
 
@@ -167,12 +178,32 @@ infra/
 
 ---
 
+## Assurance tier (state it, don't oversell it)
+
+- **Possession of the emailed link is the only signer credential.** No OTP, no sign-time
+  identity re-verification — comparable to DocuSign's basic tier. A forwarded email can be
+  signed by whoever holds it; the audit trail records the *clicker's* IP/UA. Say this when
+  it matters; add an access code or emailed OTP if a document ever warrants more.
+- **The signature is a flattened image + SHA-256 hash chain, not a PKI/PAdES signature.**
+  Integrity rests on the hashes in DynamoDB and in both parties' inboxes, not on a
+  cryptographic signature embedded in the PDF.
+- `link_opened` events include mail-scanner prefetches (e.g. Defender Safe Links) — opens
+  are not proof a human viewed the document.
+- Field cap is **50 per document** (delete+put of the full set must fit one 100-op
+  DynamoDB transaction; a higher cap made documents uneditable after the first save).
+
 ## Deferred
 
 - Multi-signer & signing order
 - Templates / reusable forms
 - Reminders / link expiry resend
 - Webhooks for status changes
+- Orphan-upload sweep (tag-on-complete + expire-untagged lifecycle rule)
+- CloudWatch alarms (Lambda errors, SES bounce/complaint rate) — SES events flow to the
+  `esign-email-events` SNS topic / `esign-ses-diagnostics` SQS queue, but those are
+  manual out-of-band resources, not part of the CDK stack
+- RFC 2231 encoding for non-ASCII attachment filenames (currently RFC 2047-in-parameter,
+  which most but not all clients render)
 - Neutral domain for esign as a product (a Ripple-branded signing link is wrong for
   client-internal documents)
 
@@ -189,6 +220,17 @@ infra/
   never runs. This shipped once: a document was signed and committed and neither party was
   ever emailed, with no error anywhere.
 
+## Milestones
+
+- **2026-08-07 — first real executed envelope**: Sean McQuillan signed the Milton AI
+  Acceptable Use Policy (16:36 CDT). Full clean trail: consent → signature → signed →
+  completion emailed.
+
 ## Last Updated
 
-2026-08-04 — serverless rewrite deployed; Postgres/docker-compose removed.
+2026-08-10 — second adversarial review's findings closed: event/field queries fully
+paginated (evidence PDF could previously drop `document_signed` past 1MB of events),
+flood-resistant evidence rendering, conditional event writes, field cap corrected to an
+honest 50, `/send` reports email failure instead of 500ing a half-sent document,
+`CloudFront-Viewer-Address` actually forwarded, MIME quote-escaping, docs de-fictioned,
+regression suite moved into the repo (`phase0-test.sh`, 21 checks).

@@ -54,7 +54,9 @@ export class EsignStack extends Stack {
         maxAge: 3000,
       }],
       lifecycleRules: [
-        // An abandoned presigned upload leaves an object with no document record.
+        // NOTE: neither rule sweeps an abandoned single-PUT presigned upload — those
+        // orphans persist (a blanket age rule would delete live originals; a real sweep
+        // needs tag-on-complete + expire-untagged, deferred; cost is pennies).
         { id: 'abort-incomplete', abortIncompleteMultipartUploadAfter: Duration.days(1) },
         { id: 'expire-old-versions', noncurrentVersionExpiration: Duration.days(365) },
       ],
@@ -167,6 +169,39 @@ function handler(event) {
       customHeaders: { 'x-esign-origin': process.env.ESIGN_ORIGIN_SECRET || 'SET_AT_DEPLOY' },
     });
 
+    // Explicit allowlist, not a managed all-viewer policy, for two reasons:
+    //  - Host must NOT be forwarded to a Function URL origin (breaks SigV4/host matching);
+    //  - CloudFront-Viewer-Address is a CloudFront-GENERATED header that only reaches the
+    //    origin when explicitly listed here — no all-viewer policy carries it. The audit
+    //    trail's IP provenance depends on it: db.js prefers this header precisely because
+    //    the edge stamps it and a client cannot, unlike x-forwarded-for's first entry.
+    //    (Under the previous managed policy the header never arrived and the code silently
+    //    used the last-XFF fallback — same IP value, weaker provenance claim.)
+    const apiOriginRequest = new cf.OriginRequestPolicy(this, 'ApiOriginRequest', {
+      comment: 'esign API: content headers + edge-attested viewer address',
+      headerBehavior: cf.OriginRequestHeaderBehavior.allowList(
+        'Content-Type', 'Accept', 'User-Agent', 'CloudFront-Viewer-Address',
+      ),
+      queryStringBehavior: cf.OriginRequestQueryStringBehavior.all(),
+      cookieBehavior: cf.OriginRequestCookieBehavior.none(),
+    });
+
+    // CloudFront refuses `Authorization` in an origin-request allowlist — the only way to
+    // forward it is through the CACHE policy's cache-key headers. And CloudFront refuses
+    // header behavior on an all-zero-TTL policy ("caching disabled"), so maxTtl is 1s:
+    // defaultTtl 0 means nothing caches unless the origin explicitly sends Cache-Control
+    // (it doesn't), and even then it's clamped to one second. The cache-key membership
+    // exists purely to carry the sender's Bearer token to the origin.
+    const apiCachePolicy = new cf.CachePolicy(this, 'ApiCachePolicy', {
+      comment: 'esign API: effectively no caching; Authorization forwarded via cache key',
+      defaultTtl: Duration.seconds(0),
+      minTtl: Duration.seconds(0),
+      maxTtl: Duration.seconds(1),
+      headerBehavior: cf.CacheHeaderBehavior.allowList('Authorization'),
+      queryStringBehavior: cf.CacheQueryStringBehavior.none(),
+      cookieBehavior: cf.CacheCookieBehavior.none(),
+    });
+
     const distribution = new cf.Distribution(this, 'Cdn', {
       domainNames: [domainName],
       certificate: cert,
@@ -185,11 +220,8 @@ function handler(event) {
           origin: apiOrigin,
           viewerProtocolPolicy: cf.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
           allowedMethods: cf.AllowedMethods.ALLOW_ALL,
-          cachePolicy: cf.CachePolicy.CACHING_DISABLED,
-          // Forwards Authorization (sender Bearer) and the viewer address used by the
-          // audit trail. ALL_VIEWER_EXCEPT_HOST_HEADER is required for a Function URL
-          // origin — a forwarded Host would break SigV4/host matching.
-          originRequestPolicy: cf.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+          cachePolicy: apiCachePolicy,
+          originRequestPolicy: apiOriginRequest,
           functionAssociations: [{
             function: stripApi,
             eventType: cf.FunctionEventType.VIEWER_REQUEST,

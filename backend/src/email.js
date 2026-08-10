@@ -87,7 +87,9 @@ export function buildMime({ from, to, replyTo, subject, html, text, attachments 
   ];
 
   for (const a of attachments) {
-    const name = encodeWord(sanitizeHeader(a.filename));
+    // quoteParam AFTER encodeWord: a filename containing `"` (which sanitizeHeader does
+    // not touch) would otherwise close the quoted parameter early and corrupt the header.
+    const name = quoteParam(encodeWord(sanitizeHeader(a.filename)));
     parts.push(
       `--${mixBoundary}`,
       `Content-Type: ${a.contentType || 'application/pdf'}; name="${name}"`,
@@ -103,6 +105,8 @@ export function buildMime({ from, to, replyTo, subject, html, text, attachments 
 
 const boundary = (tag) => `esign_${tag}_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 const sanitizeHeader = (s) => String(s).replace(/[\r\n]+/g, ' ').trim();
+// Escape backslash + double-quote for use inside a quoted MIME parameter value.
+const quoteParam = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 const base64Wrap = (buf) => buf.toString('base64').replace(/(.{76})/g, '$1\r\n');
 
 // RFC 2047 — headers are ASCII-only, so a non-ASCII filename in a subject must be encoded.

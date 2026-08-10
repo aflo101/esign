@@ -33,6 +33,7 @@ export default function Prepare() {
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [sentLink, setSentLink] = useState(null)
+  const [emailWarning, setEmailWarning] = useState(null)
 
   // Load the PDF + any previously-saved fields
   useEffect(() => {
@@ -91,6 +92,9 @@ export default function Prepare() {
       }).then(r => r.json())
       if (send.error) throw new Error(send.error)
       setSentLink(send.link)
+      // The API returns ok:true with email_sent:false when the document is sent but the
+      // notification email failed — the link works, but the signer was never told.
+      if (send.email_sent === false) setEmailWarning(send.email_error || 'email delivery failed')
     } catch (e) {
       setError(e.message)
     } finally {
@@ -106,6 +110,11 @@ export default function Prepare() {
       <div className="card">
         <h1>Sent for signature</h1>
         <p className="muted">{fields.length} field{fields.length === 1 ? '' : 's'} placed · signer: {signerEmail}</p>
+        {emailWarning && (
+          <p style={{ color: '#b45309', fontWeight: 600 }}>
+            ⚠ The signer was NOT emailed ({emailWarning}). Share the link below yourself, or re-send.
+          </p>
+        )}
         <p>Signing link (also logged to the backend console in dev):</p>
         <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{sentLink}</pre>
         <a className="btn" href={sentLink}>Open signing link</a>

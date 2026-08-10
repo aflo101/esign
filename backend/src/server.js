@@ -164,7 +164,11 @@ const wireField = (f) => ({
 });
 
 // 1a. Mint a direct-to-S3 upload URL. Writes nothing — an abandoned upload leaves an
-// orphan object (swept by lifecycle rules), not a phantom document record.
+// orphan object, not a phantom document record. Orphans currently persist (no lifecycle
+// rule targets them — a blanket age rule would delete live originals; a proper sweep
+// needs tag-on-complete + expire-untagged, deferred). Cost is pennies; do not claim
+// they are cleaned up. Presigned PUT also cannot enforce a size cap (that's a presigned
+// POST feature), so an oversized object can land in S3 — /complete rejects it there.
 app.post('/documents/init', requireSender, async (req, res) => {
   try {
     const filename = String(req.body?.filename || '').trim();
@@ -237,20 +241,33 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
       expiresAt: Date.now() + SIGNING_TOKEN_TTL_MS,
     });
     const link = `${process.env.APP_BASE_URL}/s/${token}`;
-    await sendEmail({
-      to: signer_email,
-      ...signatureRequestEmail({
-        senderName: process.env.SENDER_NAME || null,
-        senderEmail: doc.senderEmail || process.env.SES_FROM || null,
-        filename: doc.filename,
-        link,
-        expiresDays: 7,
-      }),
-    });
+
+    // The email failing (SES throttle, suppressed recipient) must not 500 this route:
+    // by this point the document is already 'sent' with a live token, so an uncaught
+    // throw told the sender "failed" about a send that half-happened, logged nothing,
+    // and withheld the one thing that still works — the link. Report honestly instead.
+    let emailError = null;
+    try {
+      await sendEmail({
+        to: signer_email,
+        ...signatureRequestEmail({
+          senderName: process.env.SENDER_NAME || null,
+          senderEmail: doc.senderEmail || process.env.SES_FROM || null,
+          filename: doc.filename,
+          link,
+          expiresDays: 7,
+        }),
+      });
+    } catch (err) {
+      console.error(`signature-request email to ${signer_email} failed:`, err);
+      emailError = err.message;
+    }
     // Never log the link itself — event metadata is printed verbatim into the evidence
     // PDF that goes to both parties, which would publish a live credential.
-    await logEvent(id, 'link_sent', req, { signer_email, token_fp: tokenFingerprint(token) });
-    res.json({ ok: true, link });
+    await logEvent(id, emailError ? 'link_send_failed' : 'link_sent', req, {
+      signer_email, token_fp: tokenFingerprint(token), ...(emailError ? { error: emailError } : {}),
+    });
+    res.json({ ok: true, link, email_sent: !emailError, ...(emailError ? { email_error: emailError } : {}) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -604,13 +621,27 @@ async function buildEvidencePdf(docId) {
     pdf.moveDown();
     pdf.fontSize(14).text('Event Log');
     pdf.fontSize(9);
-    // `link_opened` fires on every page refresh, so the log has no natural ceiling.
-    // Render the most recent EVENT_RENDER_CAP and say so, rather than emit an unbounded PDF.
-    const shown = events.length > EVENT_RENDER_CAP ? events.slice(-EVENT_RENDER_CAP) : events;
-    if (shown.length < events.length) {
+    // `link_opened` fires on every page refresh, so the log has no natural ceiling — and a
+    // naive "most recent N" let a flooded log evict consent_given / document_signed, the
+    // exact records this package exists to preserve. Under pressure: summarize the opens
+    // (count + first/last, keeping their evidentiary shape) and render every other event;
+    // if even that overflows, keep both ends of the timeline, never a window that can lose
+    // the signing events. listEvents is fully paginated, so `events` is always complete.
+    let shown = events;
+    if (events.length > EVENT_RENDER_CAP) {
+      const opens = events.filter(e => e.type === 'link_opened');
+      shown = events.filter(e => e.type !== 'link_opened');
       pdf.fillColor('#b45309')
-         .text(`   (showing the most recent ${shown.length} of ${events.length} events)`)
+         .text(`   (link_opened x${opens.length} summarized: first ${opens[0]?.createdAt || '-'}, last ${opens[opens.length - 1]?.createdAt || '-'})`)
          .fillColor('black');
+      if (shown.length > EVENT_RENDER_CAP) {
+        const head = shown.slice(0, 50);
+        const tail = shown.slice(-(EVENT_RENDER_CAP - 50));
+        pdf.fillColor('#b45309')
+           .text(`   (${shown.length - head.length - tail.length} mid-log events elided; first ${head.length} and last ${tail.length} shown)`)
+           .fillColor('black');
+        shown = [...head, ...tail];
+      }
     }
     for (const e of shown) {
       pdf.moveDown(0.5);
