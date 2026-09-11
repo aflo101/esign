@@ -9,7 +9,7 @@ import 'dotenv/config';
 import { logEvent, clientIp } from './db.js';
 import * as repo from './repo.js';
 import { putObject, getObject, presignPut, presignGet, headObject } from './storage.js';
-import { sendEmail } from './email.js';
+import { sendEmail, normalizeCc } from './email.js';
 import { signatureRequestEmail, completionEmail } from './templates.js';
 
 const app = express();
@@ -132,6 +132,14 @@ function rateLimit({ max, windowSeconds, name }) {
 
 const SIGNING_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// CC plumbing. Deliberately permissive on shape (comma OR semicolon separated, since these
+// get pasted out of mail clients) and strict on the result — a malformed address makes SES
+// reject the whole SendEmail call, which would fail a send whose token is already live.
+const MAX_CC = 10;
+const LOOKS_LIKE_EMAIL = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
+const splitAddresses = (v) =>
+  (Array.isArray(v) ? v : String(v ?? '').split(/[,;]/)).map(a => String(a).trim()).filter(Boolean);
+
 /**
  * Resolve an opaque signing token and bind it to the document's *current* state.
  *
@@ -221,8 +229,17 @@ app.post('/documents/:id/complete', requireSender, async (req, res) => {
 app.post('/documents/:id/send', requireSender, async (req, res) => {
   try {
     const { id } = req.params;
-    const { signer_email } = req.body;
+    const { signer_email, cc_email } = req.body;
     if (!signer_email) return res.status(400).json({ error: 'signer_email required' });
+    // CC is optional and additive: SES_DEFAULT_CC copies every envelope (the sender wants a
+    // record of what went out) and cc_email adds per-send addresses on top.
+    const ccList = normalizeCc(
+      [...splitAddresses(process.env.SES_DEFAULT_CC), ...splitAddresses(cc_email)],
+      signer_email,
+    );
+    const badCc = ccList.find(a => !LOOKS_LIKE_EMAIL.test(a));
+    if (badCc) return res.status(400).json({ error: `invalid cc_email: ${badCc}` });
+    if (ccList.length > MAX_CC) return res.status(400).json({ error: `at most ${MAX_CC} cc addresses` });
     const doc = await repo.getDocument(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
 
@@ -230,7 +247,7 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     const nonce = crypto.randomBytes(9).toString('base64url');
     // An executed document is final — re-sending would reset it to 'sent' and allow
     // the signed contract to be signed again over the top of itself.
-    const updated = await repo.markSent({ id, signerEmail: signer_email, tokenNonce: nonce });
+    const updated = await repo.markSent({ id, signerEmail: signer_email, ccEmails: ccList, tokenNonce: nonce });
     if (!updated) return res.status(409).json({ error: 'already signed' });
 
     // 128 bits of opaque randomness — short enough for a clean link, revocable, and
@@ -250,6 +267,7 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     try {
       await sendEmail({
         to: signer_email,
+        cc: ccList,
         ...signatureRequestEmail({
           senderName: process.env.SENDER_NAME || null,
           senderEmail: doc.senderEmail || process.env.SES_FROM || null,
@@ -264,10 +282,17 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     }
     // Never log the link itself — event metadata is printed verbatim into the evidence
     // PDF that goes to both parties, which would publish a live credential.
+    // cc recipients are recorded because they hold a signable credential — the evidence
+    // package must show who else received the link, not just the named signer.
     await logEvent(id, emailError ? 'link_send_failed' : 'link_sent', req, {
-      signer_email, token_fp: tokenFingerprint(token), ...(emailError ? { error: emailError } : {}),
+      signer_email, ...(ccList.length ? { cc_emails: ccList } : {}),
+      token_fp: tokenFingerprint(token), ...(emailError ? { error: emailError } : {}),
     });
-    res.json({ ok: true, link, email_sent: !emailError, ...(emailError ? { email_error: emailError } : {}) });
+    res.json({
+      ok: true, link, email_sent: !emailError,
+      ...(ccList.length ? { cc_emails: ccList } : {}),
+      ...(emailError ? { email_error: emailError } : {}),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -522,7 +547,9 @@ app.post('/sign/:token', signerLimit(), async (req, res) => {
 // signer as a signing failure — that drove a retry which then 410s, leaving them with an
 // executed contract and no copy of it. Failures are logged as events instead.
 async function deliverCompletion({ doc, signedHash, signedBytes, req }) {
-  const recipients = [doc.signerEmail, doc.senderEmail].filter(Boolean);
+  // CC'd parties get the executed PDF + evidence too — a copy of the request without a copy
+  // of the result is the useless half. Deduped so a cc that equals the sender sends once.
+  const recipients = normalizeCc([doc.signerEmail, doc.senderEmail, ...(doc.ccEmails || [])]);
   if (!recipients.length) return;
 
   const signedBuffer = Buffer.from(signedBytes);

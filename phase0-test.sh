@@ -25,6 +25,12 @@ place() { curl -s -X PUT $API/documents/$1/fields -H 'Content-Type: application/
 send() { curl -s -X POST $API/documents/$1/send -H 'Content-Type: application/json' \
   -d "{\"signer_email\":\"$2\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["link"].rsplit("/",1)[1])'; }
 fieldid() { curl -s $API/sign/$1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["fields"][0]["id"])'; }
+# send with a cc — returns the raw JSON body so cc_emails / errors can be asserted.
+sendcc() { curl -s -X POST $API/documents/$1/send -H 'Content-Type: application/json' \
+  -d "{\"signer_email\":\"$2\",\"cc_email\":\"$3\"}"; }
+sendccode() { curl -s -o /dev/null -w '%{http_code}' -X POST $API/documents/$1/send \
+  -H 'Content-Type: application/json' -d "{\"signer_email\":\"$2\",\"cc_email\":\"$3\"}"; }
+jqf() { python3 -c "import json,sys;d=json.load(sys.stdin);print(json.dumps(d.get('$1','')) if not isinstance(d.get('$1'),str) else d['$1'])"; }
 
 # Build the JSON in a variable — inlining escaped quotes inside "$( ... )" mangles them
 # into invalid JSON, which express rejects at the body parser (400) before any route runs.
@@ -99,6 +105,39 @@ EV4=$(curl -s $API/documents/$ID4/evidence | python3 -c 'import json,sys;print(j
 curl -s "$EV4" -o /tmp/ev4.pdf; T4TXT=$(pdftotext /tmp/ev4.pdf - 2>/dev/null)
 echo "$T4TXT" | grep -q "consent_given" && chk "consent recorded in evidence PDF" "yes" "yes" || chk "consent recorded in evidence PDF" "yes" "MISSING"
 echo "$T4TXT" | grep -q "document_signed" && chk "document_signed present in evidence PDF" "yes" "yes" || chk "document_signed present in evidence PDF" "yes" "MISSING"
+
+echo "=== CC on the signature request ==="
+ID5=$(upload); place $ID5
+CC5=$(sendcc $ID5 erin@test.local "cc-one@test.local, cc-two@test.local")
+chk "cc addresses echoed back on send" '["cc-one@test.local", "cc-two@test.local"]' "$(echo "$CC5" | jqf cc_emails)"
+chk "comma-separated cc list is split" "2" \
+  "$(echo "$CC5" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["cc_emails"]))')"
+# A cc equal to the signer would make SES reject the whole Destination and 500 a send whose
+# token is already live — it must be dropped, not passed through.
+chk "self-cc (cc == signer) is dropped" '""' \
+  "$(sendcc $ID5 erin@test.local "erin@test.local" | jqf cc_emails)"
+chk "case-insensitive duplicate cc is deduped" "1" \
+  "$(sendcc $ID5 erin@test.local "Dup@test.local, dup@test.local" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["cc_emails"]))')"
+chk "malformed cc is rejected before send" "400" "$(sendccode $ID5 erin@test.local "not-an-email")"
+chk "cc over the cap is rejected" "400" \
+  "$(sendccode $ID5 erin@test.local "a@t.co,b@t.co,c@t.co,d@t.co,e@t.co,f@t.co,g@t.co,h@t.co,i@t.co,j@t.co,k@t.co")"
+# A cc dropped from a re-send must not survive from the previous send.
+chk "re-send without cc clears the previous cc" '""' "$(sendcc $ID5 erin@test.local "" | jqf cc_emails)"
+
+echo "=== CC receives the executed document ==="
+ID6=$(upload); place $ID6
+sendcc $ID6 frank@test.local "watcher@test.local" >/dev/null
+T6=$(curl -s -X POST $API/documents/$ID6/send -H 'Content-Type: application/json' \
+  -d '{"signer_email":"frank@test.local","cc_email":"watcher@test.local"}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["link"].rsplit("/",1)[1])')
+F6=$(fieldid $T6)
+chk "signing a cc'd document succeeds" "200" "$(signreq $T6 $F6 Frank)"
+sleep 1
+EV6=$(curl -s $API/documents/$ID6/evidence | python3 -c 'import json,sys;print(json.load(sys.stdin)["url"])')
+curl -s "$EV6" -o /tmp/ev6.pdf; T6TXT=$(pdftotext /tmp/ev6.pdf - 2>/dev/null)
+# The cc holds a signable credential, so the evidence package must name them.
+echo "$T6TXT" | grep -q "watcher@test.local" && chk "cc recorded in evidence PDF" "yes" "yes" || chk "cc recorded in evidence PDF" "yes" "MISSING"
+echo "$T6TXT" | grep -q "completion_emailed" && chk "completion delivered with cc present" "yes" "yes" || chk "completion delivered with cc present" "yes" "MISSING"
 
 echo
 echo "=== RESULT: $pass passed, $fail failed ==="

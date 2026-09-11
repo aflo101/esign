@@ -7,6 +7,7 @@ export default function Upload() {
   const [file, setFile] = useState(null)
   const [senderEmail, setSenderEmail] = useState('')
   const [signerEmail, setSignerEmail] = useState('')
+  const [ccEmail, setCcEmail] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
@@ -35,7 +36,7 @@ export default function Upload() {
       if (up.error) throw new Error(up.error)
       // Hand off to the Prepare step (place fields, then send) — carry the emails forward.
       navigate(`/prepare/${up.id}`, {
-        state: { sender_email: senderEmail, signer_email: signerEmail, filename: up.filename },
+        state: { sender_email: senderEmail, signer_email: signerEmail, cc_email: ccEmail, filename: up.filename },
       })
     } catch (e) {
       setError(e.message)
@@ -59,6 +60,15 @@ export default function Upload() {
         <div className="field">
           <label>Signer's email</label>
           <input type="email" value={signerEmail} onChange={e => setSignerEmail(e.target.value)} required placeholder="signer@example.com" />
+        </div>
+        <div className="field">
+          <label>Cc (optional)</label>
+          {/* Not type="email" — that input rejects a comma-separated list. */}
+          <input type="text" value={ccEmail} onChange={e => setCcEmail(e.target.value)} placeholder="someone@example.com, other@example.com" />
+          <p className="muted" style={{ margin: '4px 0 0', fontSize: 12 }}>
+            Cc'd addresses receive the signing link and the executed copy. Anyone holding the
+            link can sign, so only Cc people who should have that ability.
+          </p>
         </div>
         <button className="btn" disabled={busy || !file}>{busy ? 'Uploading…' : 'Upload & prepare'}</button>
       </form>

@@ -92,14 +92,18 @@ export async function getDocument(id, { consistent = false } = {}) {
 }
 
 /** Mark sent + rotate the token nonce. Rejects an already-executed document. */
-export async function markSent({ id, signerEmail, tokenNonce }) {
+export async function markSent({ id, signerEmail, ccEmails = [], tokenNonce }) {
   try {
+    // ccEmails is overwritten on every send, not appended to: a re-send re-states who the
+    // recipients are, so a cc dropped from the second send must not survive from the first.
     const { Attributes } = await db().send(new UpdateCommand({
       TableName: TABLE, Key: { PK: docPk(id), SK: 'META' },
-      UpdateExpression: 'SET signerEmail = :s, tokenNonce = :n, #st = :sent',
+      UpdateExpression: 'SET signerEmail = :s, ccEmails = :cc, tokenNonce = :n, #st = :sent',
       ConditionExpression: 'attribute_exists(PK) AND #st <> :signed',
       ExpressionAttributeNames: { '#st': 'status' },
-      ExpressionAttributeValues: { ':s': signerEmail, ':n': tokenNonce, ':sent': 'sent', ':signed': 'signed' },
+      ExpressionAttributeValues: {
+        ':s': signerEmail, ':cc': ccEmails, ':n': tokenNonce, ':sent': 'sent', ':signed': 'signed',
+      },
       ReturnValues: 'ALL_NEW',
     }));
     return Attributes;

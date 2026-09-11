@@ -111,7 +111,7 @@ evidence package.
 | POST | `/documents/:id/complete` | register the upload, hash server-side |
 | GET/PUT | `/documents/:id/fields` | list / replace placed fields |
 | GET | `/documents/:id/pdf` | presigned GET URL (JSON, not bytes) |
-| POST | `/documents/:id/send` | issue token, email signer |
+| POST | `/documents/:id/send` | issue token, email signer (+ optional `cc_email`) |
 | GET | `/documents/:id/evidence` | presigned evidence URL |
 | POST | `/auth/login`, GET `/auth/status` | sender auth |
 | GET | `/sign/:token` | doc meta + fields + consent statement |
@@ -134,6 +134,24 @@ custom MAIL FROM (`mail.rippleconsultingservices.com`), DMARC `p=none`.
 
 Messages are `multipart/alternative` (plain-text part is not politeness — a lone `text/html`
 body is a spam signal). Completion emails add the signed PDF and evidence as attachments.
+
+### CC
+
+`/send` accepts `cc_email` (a string or array; comma- or semicolon-separated lists are split,
+because these get pasted out of mail clients). `SES_DEFAULT_CC` copies **every** envelope and
+per-send addresses are added on top of it, not instead of it. Cc'd parties receive both the
+signature request and the completion mail with the signed PDF + evidence attached — a copy of
+the request without a copy of the result is the useless half.
+
+- Addresses are validated **before** the token is minted. A malformed address makes SES reject
+  the whole `SendEmail` call, which would otherwise fail a send whose link is already live.
+- `cc == signer` is dropped and duplicates are deduped case-insensitively — SES rejects a
+  `Destination` that repeats an address.
+- The `Cc:` MIME header is kept in sync with `CcAddresses`. SES honours the envelope either
+  way, but a recipient who cannot see themselves in the headers reads the mail as bcc'd spam.
+- `ccEmails` is **overwritten** on each send, never appended — a re-send re-states the
+  recipient set, so a cc dropped from the second send must not survive from the first.
+- Cap: **10** cc addresses per document.
 
 Bounce/complaint/delivery events flow to SNS topic `esign-email-events` and on to the
 `esign-ses-diagnostics` SQS queue, which is how the receiving MTA's actual SMTP response
@@ -184,6 +202,11 @@ infra/
   identity re-verification — comparable to DocuSign's basic tier. A forwarded email can be
   signed by whoever holds it; the audit trail records the *clicker's* IP/UA. Say this when
   it matters; add an access code or emailed OTP if a document ever warrants more.
+- **⚑ Every cc is therefore a second party who can sign.** CC does not create a read-only
+  observer — it puts the sole signer credential in another mailbox, and the audit trail will
+  name the signer as whoever the document says it is regardless of who clicked. `link_sent`
+  records `cc_emails` so the evidence package shows who else held the link. Do not cc a
+  distribution list or shared mailbox on a document that matters.
 - **The signature is a flattened image + SHA-256 hash chain, not a PKI/PAdES signature.**
   Integrity rests on the hashes in DynamoDB and in both parties' inboxes, not on a
   cryptographic signature embedded in the PDF.
@@ -196,7 +219,7 @@ infra/
 
 - Multi-signer & signing order
 - Templates / reusable forms
-- Reminders / link expiry resend
+- Reminders (link expiry resend works today — re-POST `/send`, which rotates the nonce)
 - Webhooks for status changes
 - Orphan-upload sweep (tag-on-complete + expire-untagged lifecycle rule)
 - CloudWatch alarms (Lambda errors, SES bounce/complaint rate) — SES events flow to the
@@ -228,9 +251,16 @@ infra/
 
 ## Last Updated
 
-2026-08-10 — second adversarial review's findings closed: event/field queries fully
+2026-09-11 — **CC support added.** `/send` takes `cc_email`; `SES_DEFAULT_CC` copies every
+envelope. Cc'd parties get the signature request and the executed PDF + evidence, are recorded
+in `link_sent` and the evidence package, and are validated/deduped before the token is minted.
+Regression suite extended to **31 checks** (10 new, covering self-cc, case-insensitive dedupe,
+malformed and over-cap rejection, cc cleared on re-send, and cc receiving the executed doc).
+Assurance tier updated: **a cc is a second party who can sign**, not a read-only observer.
+
+*Prior: 2026-08-10 — second adversarial review's findings closed: event/field queries fully
 paginated (evidence PDF could previously drop `document_signed` past 1MB of events),
 flood-resistant evidence rendering, conditional event writes, field cap corrected to an
 honest 50, `/send` reports email failure instead of 500ing a half-sent document,
 `CloudFront-Viewer-Address` actually forwarded, MIME quote-escaping, docs de-fictioned,
-regression suite moved into the repo (`phase0-test.sh`, 21 checks).
+regression suite moved into the repo (`phase0-test.sh`, 21 checks).*

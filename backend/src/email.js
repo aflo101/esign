@@ -11,13 +11,18 @@ const ses = () => (sesClient ||= new SESv2Client({ region: process.env.AWS_REGIO
 
 const fromHeader = () => `${encodeWord(FROM_NAME)} <${FROM}>`;
 
-export async function sendEmail({ to, subject, html, text, attachments }) {
+// `cc` accepts a string or an array; it is normalized here so every caller and both
+// EMAIL_MODEs see one shape. CC'd parties are real recipients of the signature-request
+// mail, which carries the live signing link — see the assurance note in project.md.
+export async function sendEmail({ to, cc, subject, html, text, attachments }) {
+  const ccList = normalizeCc(cc, to);
   // Console mode — dev default, logs instead of sending.
   if (process.env.EMAIL_MODE === 'console') {
     console.log('\n--- EMAIL (console mode) ---');
     console.log(`From: ${fromHeader()}`);
     if (REPLY_TO) console.log(`Reply-To: ${REPLY_TO}`);
     console.log(`To: ${to}`);
+    if (ccList.length) console.log(`Cc: ${ccList.join(', ')}`);
     console.log(`Subject: ${subject}`);
     console.log(text || html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
     if (attachments?.length) console.log(`Attachments: ${attachments.map(a => a.filename).join(', ')}`);
@@ -26,10 +31,10 @@ export async function sendEmail({ to, subject, html, text, attachments }) {
   }
 
   if (process.env.EMAIL_MODE === 'ses') {
-    const raw = buildMime({ from: fromHeader(), to, replyTo: REPLY_TO, subject, html, text, attachments });
+    const raw = buildMime({ from: fromHeader(), to, cc: ccList, replyTo: REPLY_TO, subject, html, text, attachments });
     const out = await ses().send(new SendEmailCommand({
       FromEmailAddress: fromHeader(),
-      Destination: { ToAddresses: [to] },
+      Destination: { ToAddresses: [to], ...(ccList.length ? { CcAddresses: ccList } : {}) },
       ...(REPLY_TO ? { ReplyToAddresses: [REPLY_TO] } : {}),
       ...(CONFIG_SET ? { ConfigurationSetName: CONFIG_SET } : {}),
       Content: { Raw: { Data: Buffer.from(raw) } },
@@ -45,13 +50,17 @@ export async function sendEmail({ to, subject, html, text, attachments }) {
 //   attachments:    multipart/mixed [ multipart/alternative [text, html], ...files ]
 // The plain-text part isn't optional politeness: a lone text/html body is a well-known
 // spam signal, and this mail needs to reach an inbox on first contact.
-export function buildMime({ from, to, replyTo, subject, html, text, attachments }) {
+export function buildMime({ from, to, cc, replyTo, subject, html, text, attachments }) {
+  const ccList = normalizeCc(cc, to);
   const plain = text || html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   const altBoundary = boundary('alt');
 
   const headers = [
     `From: ${from}`,
     `To: ${sanitizeHeader(to)}`,
+    // The Cc header must match the SES CcAddresses list — SES honours the envelope, but a
+    // recipient who cannot see themselves in the headers reads the mail as bcc'd spam.
+    ...(ccList.length ? [`Cc: ${ccList.map(sanitizeHeader).join(', ')}`] : []),
     ...(replyTo ? [`Reply-To: ${sanitizeHeader(replyTo)}`] : []),
     `Subject: ${encodeWord(sanitizeHeader(subject))}`,
     'MIME-Version: 1.0',
@@ -102,6 +111,23 @@ export function buildMime({ from, to, replyTo, subject, html, text, attachments 
   parts.push(`--${mixBoundary}--`, '');
   return headers.join('\r\n') + '\r\n\r\n' + parts.join('\r\n');
 }
+
+// Deduped case-insensitively: SES rejects a Destination that repeats an address, and a
+// self-CC (cc == to) would otherwise send the signer two copies of their own request.
+export const normalizeCc = (cc, exclude = null) => {
+  const list = Array.isArray(cc) ? cc : cc ? [cc] : [];
+  const seen = new Set(exclude ? [String(exclude).trim().toLowerCase()] : []);
+  const out = [];
+  for (const raw of list) {
+    const addr = String(raw || '').trim();
+    if (!addr) continue;
+    const key = addr.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(addr);
+  }
+  return out;
+};
 
 const boundary = (tag) => `esign_${tag}_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 const sanitizeHeader = (s) => String(s).replace(/[\r\n]+/g, ' ').trim();

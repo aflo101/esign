@@ -30,9 +30,11 @@ export default function Prepare() {
   const [activePage, setActivePage] = useState(0)
   const [selectedId, setSelectedId] = useState(null)
   const [signerEmail, setSignerEmail] = useState(nav.signer_email || '')
+  const [ccEmail, setCcEmail] = useState(nav.cc_email || '')
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
   const [sentLink, setSentLink] = useState(null)
+  const [sentCc, setSentCc] = useState([])
   const [emailWarning, setEmailWarning] = useState(null)
 
   // Load the PDF + any previously-saved fields
@@ -88,10 +90,11 @@ export default function Prepare() {
       if (put.error) throw new Error(put.error)
       const send = await fetch(`/api/documents/${id}/send`, {
         method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ signer_email: signerEmail }),
+        body: JSON.stringify({ signer_email: signerEmail, cc_email: ccEmail }),
       }).then(r => r.json())
       if (send.error) throw new Error(send.error)
       setSentLink(send.link)
+      setSentCc(send.cc_emails || [])
       // The API returns ok:true with email_sent:false when the document is sent but the
       // notification email failed — the link works, but the signer was never told.
       if (send.email_sent === false) setEmailWarning(send.email_error || 'email delivery failed')
@@ -109,7 +112,10 @@ export default function Prepare() {
     return (
       <div className="card">
         <h1>Sent for signature</h1>
-        <p className="muted">{fields.length} field{fields.length === 1 ? '' : 's'} placed · signer: {signerEmail}</p>
+        <p className="muted">
+          {fields.length} field{fields.length === 1 ? '' : 's'} placed · signer: {signerEmail}
+          {sentCc.length > 0 && <> · cc: {sentCc.join(', ')}</>}
+        </p>
         {emailWarning && (
           <p style={{ color: '#b45309', fontWeight: 600 }}>
             ⚠ The signer was NOT emailed ({emailWarning}). Share the link below yourself, or re-send.
@@ -159,6 +165,10 @@ export default function Prepare() {
         <div className="field" style={{ flex: 1, minWidth: 220, margin: 0 }}>
           <label>Signer's email</label>
           <input type="email" value={signerEmail} onChange={e => setSignerEmail(e.target.value)} placeholder="signer@example.com" />
+        </div>
+        <div className="field" style={{ flex: 1, minWidth: 220, margin: 0 }}>
+          <label>Cc (optional)</label>
+          <input type="text" value={ccEmail} onChange={e => setCcEmail(e.target.value)} placeholder="cc@example.com" />
         </div>
         <div className="muted">{fields.length} field{fields.length === 1 ? '' : 's'}</div>
         <button className="btn" type="button" disabled={busy} onClick={saveAndSend}>
