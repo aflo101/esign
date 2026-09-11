@@ -229,19 +229,26 @@ app.post('/documents/:id/complete', requireSender, async (req, res) => {
 app.post('/documents/:id/send', requireSender, async (req, res) => {
   try {
     const { id } = req.params;
-    const { signer_email, cc_email } = req.body;
+    const { signer_email, cc_email, cc_sender } = req.body;
     if (!signer_email) return res.status(400).json({ error: 'signer_email required' });
-    // CC is optional and additive: SES_DEFAULT_CC copies every envelope (the sender wants a
-    // record of what went out) and cc_email adds per-send addresses on top.
-    const ccList = normalizeCc(
-      [...splitAddresses(process.env.SES_DEFAULT_CC), ...splitAddresses(cc_email)],
-      signer_email,
-    );
-    const badCc = ccList.find(a => !LOOKS_LIKE_EMAIL.test(a));
-    if (badCc) return res.status(400).json({ error: `invalid cc_email: ${badCc}` });
-    if (ccList.length > MAX_CC) return res.status(400).json({ error: `at most ${MAX_CC} cc addresses` });
     const doc = await repo.getDocument(id);
     if (!doc) return res.status(404).json({ error: 'not found' });
+
+    // CC defaults to the sender. The sender already receives the completion mail but was
+    // never copied on the request itself, so they had no record of what went out or of the
+    // link they may need to re-share — which is exactly the gap that stranded two envelopes
+    // for a fortnight. Derived from the document's own senderEmail rather than configured,
+    // so a per-sender deployment needs no env var. Pass cc_sender:false to suppress it.
+    const senderCc = cc_sender === false ? [] : splitAddresses(doc.senderEmail);
+    const ccList = normalizeCc(
+      [...senderCc, ...splitAddresses(process.env.SES_DEFAULT_CC), ...splitAddresses(cc_email)],
+      signer_email,
+    );
+    // Validate before the token is minted: a malformed address makes SES reject the whole
+    // SendEmail call, which would fail a send whose link is already live.
+    const badCc = ccList.find(a => !LOOKS_LIKE_EMAIL.test(a));
+    if (badCc) return res.status(400).json({ error: `invalid cc address: ${badCc}` });
+    if (ccList.length > MAX_CC) return res.status(400).json({ error: `at most ${MAX_CC} cc addresses` });
 
     // New nonce per send → every previously issued link for this document stops working.
     const nonce = crypto.randomBytes(9).toString('base64url');

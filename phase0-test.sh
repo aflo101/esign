@@ -27,9 +27,12 @@ send() { curl -s -X POST $API/documents/$1/send -H 'Content-Type: application/js
 fieldid() { curl -s $API/sign/$1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["fields"][0]["id"])'; }
 # send with a cc — returns the raw JSON body so cc_emails / errors can be asserted.
 sendcc() { curl -s -X POST $API/documents/$1/send -H 'Content-Type: application/json' \
+  -d "{\"signer_email\":\"$2\",\"cc_email\":\"$3\",\"cc_sender\":false}"; }
+# Same, but leaves the sender auto-cc in place.
+sendccs() { curl -s -X POST $API/documents/$1/send -H 'Content-Type: application/json' \
   -d "{\"signer_email\":\"$2\",\"cc_email\":\"$3\"}"; }
 sendccode() { curl -s -o /dev/null -w '%{http_code}' -X POST $API/documents/$1/send \
-  -H 'Content-Type: application/json' -d "{\"signer_email\":\"$2\",\"cc_email\":\"$3\"}"; }
+  -H 'Content-Type: application/json' -d "{\"signer_email\":\"$2\",\"cc_email\":\"$3\",\"cc_sender\":false}"; }
 jqf() { python3 -c "import json,sys;d=json.load(sys.stdin);print(json.dumps(d.get('$1','')) if not isinstance(d.get('$1'),str) else d['$1'])"; }
 
 # Build the JSON in a variable — inlining escaped quotes inside "$( ... )" mangles them
@@ -123,6 +126,20 @@ chk "cc over the cap is rejected" "400" \
   "$(sendccode $ID5 erin@test.local "a@t.co,b@t.co,c@t.co,d@t.co,e@t.co,f@t.co,g@t.co,h@t.co,i@t.co,j@t.co,k@t.co")"
 # A cc dropped from a re-send must not survive from the previous send.
 chk "re-send without cc clears the previous cc" '""' "$(sendcc $ID5 erin@test.local "" | jqf cc_emails)"
+
+echo "=== sender is cc'd by default ==="
+ID7=$(upload); place $ID7
+# upload() registers sender@test.local as the sender.
+chk "sender auto-cc'd with no cc_email given" '["sender@test.local"]' \
+  "$(sendccs $ID7 gina@test.local "" | jqf cc_emails)"
+chk "sender auto-cc is additive with cc_email" '["sender@test.local", "extra@test.local"]' \
+  "$(sendccs $ID7 gina@test.local "extra@test.local" | jqf cc_emails)"
+chk "cc_sender:false suppresses the sender auto-cc" '""' \
+  "$(sendcc $ID7 gina@test.local "" | jqf cc_emails)"
+# A sender who signs their own document must not be cc'd onto their own request.
+ID8=$(upload); place $ID8
+chk "sender who is also the signer is not cc'd" '""' \
+  "$(sendccs $ID8 sender@test.local "" | jqf cc_emails)"
 
 echo "=== CC receives the executed document ==="
 ID6=$(upload); place $ID6

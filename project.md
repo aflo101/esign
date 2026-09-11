@@ -137,9 +137,15 @@ body is a spam signal). Completion emails add the signed PDF and evidence as att
 
 ### CC
 
-`/send` accepts `cc_email` (a string or array; comma- or semicolon-separated lists are split,
-because these get pasted out of mail clients). `SES_DEFAULT_CC` copies **every** envelope and
-per-send addresses are added on top of it, not instead of it. Cc'd parties receive both the
+**The sender is cc'd by default** — taken from the document's own `senderEmail`, so nothing
+needs configuring per deployment. The sender already received the completion mail but was never
+copied on the *request*, so they held no record of what went out and no copy of the link they
+may need to re-share; that gap is what let two envelopes sit dead for a fortnight. Pass
+`cc_sender: false` to suppress it.
+
+`/send` also accepts `cc_email` (a string or array; comma- or semicolon-separated lists are
+split, because these get pasted out of mail clients), and `SES_DEFAULT_CC` copies **every**
+envelope. All three sources are additive, not exclusive. Cc'd parties receive both the
 signature request and the completion mail with the signed PDF + evidence attached — a copy of
 the request without a copy of the result is the useless half.
 
