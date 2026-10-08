@@ -30,6 +30,7 @@ yarn-error.log*
 .idea
 
 SENDER-PASSWORD.txt
+SENDER-API-KEY.txt
 infra/.deploy-env
 infra/cdk.out/
 infra/node_modules/
