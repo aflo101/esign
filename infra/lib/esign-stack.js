@@ -24,7 +24,7 @@ export class EsignStack extends Stack {
   constructor(scope, id, props) {
     super(scope, id, props);
 
-    const { domainName, hostedZoneId, zoneName, sesFrom, sesReplyTo, senderName, configurationSet } = props;
+    const { domainName, hostedZoneId, zoneName, sesFrom, sesReplyTo, senderName, configurationSet, legacySenderEmail } = props;
 
     // --- Data ----------------------------------------------------------------
     // RETAIN + PITR + deletion protection: this table IS the audit trail for executed
@@ -37,6 +37,15 @@ export class EsignStack extends Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       deletionProtection: true,
       removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    // Per-sender listing ("My documents"): DOC items carry GSI1PK=OWNER#<email>,
+    // GSI1SK=createdAt. Additive only — an in-place GSI add on the RETAIN table, no replacement.
+    table.addGlobalSecondaryIndex({
+      indexName: 'GSI1',
+      partitionKey: { name: 'GSI1PK', type: ddb.AttributeType.STRING },
+      sortKey: { name: 'GSI1SK', type: ddb.AttributeType.STRING },
+      projectionType: ddb.ProjectionType.ALL,
     });
 
     // Versioned so a signed PDF can never be silently replaced or lost.
@@ -101,6 +110,9 @@ export class EsignStack extends Stack {
         SES_REPLY_TO: sesReplyTo,
         SES_CONFIGURATION_SET: configurationSet,
         SENDER_NAME: senderName,
+        // Cutover only: the legacy shared-password login issues a session for this user.
+        // Remove together with SENDER_PASSWORD_PARAM once magic-link login is proven.
+        LEGACY_SENDER_EMAIL: legacySenderEmail,
         JWT_SECRET_PARAM: jwtSecret.parameterName,
         SENDER_PASSWORD_PARAM: senderPassword.parameterName,
         ORIGIN_SECRET_PARAM: originSecret.parameterName,
@@ -181,6 +193,8 @@ function handler(event) {
       comment: 'esign API: content headers + edge-attested viewer address',
       headerBehavior: cf.OriginRequestHeaderBehavior.allowList(
         'Content-Type', 'Accept', 'User-Agent', 'CloudFront-Viewer-Address',
+        // Script auth (send_round.py). Without this CloudFront strips it and API-key calls 401.
+        'X-Api-Key',
       ),
       queryStringBehavior: cf.OriginRequestQueryStringBehavior.all(),
       cookieBehavior: cf.OriginRequestCookieBehavior.none(),

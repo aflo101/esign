@@ -132,3 +132,33 @@ These hashes let either party verify the attached files haven't been altered sin
     text,
   };
 }
+
+/** Sender sign-in link (magic link). Single-use, short-lived. */
+export function magicLinkEmail({ name, link, expiresMinutes = 15 }) {
+  const bodyHtml = `
+    <p style="margin:0 0 18px;font-family:${FONT};font-size:15px;line-height:1.6;color:${INK};">
+      ${name ? `Hi ${esc(name)}, use` : 'Use'} the button below to sign in to esign.
+    </p>
+    ${button(link, 'Sign in')}
+    <p style="margin:18px 0 0;font-family:${FONT};font-size:13px;line-height:1.6;color:${MUTED};">
+      This link works once and expires in ${expiresMinutes} minutes. If the button doesn't work, paste this into your browser:<br>
+      <span style="color:${ACCENT};word-break:break-all;">${esc(link)}</span>
+    </p>`;
+
+  const text = `Use this link to sign in to esign:
+${link}
+
+It works once and expires in ${expiresMinutes} minutes.
+
+If you didn't request it, you can ignore this message.`;
+
+  return {
+    subject: 'Your esign sign-in link',
+    html: layout({
+      heading: 'Sign in to esign',
+      bodyHtml,
+      footerNote: "If you didn't request this, you can ignore this message — no one can sign in without the link.",
+    }),
+    text,
+  };
+}

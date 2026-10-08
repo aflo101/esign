@@ -11,6 +11,7 @@ new EsignStack(app, 'EsignStack', {
   sesFrom: 'esign@rippleconsultingservices.com',
   sesReplyTo: 'esign@rippleconsultingservices.com',
   senderName: 'Alex Flores',
+  legacySenderEmail: 'aflores@miltonindustries.com',
   configurationSet: 'esign-events',
   description: 'esign — self-hosted e-signature service',
 });

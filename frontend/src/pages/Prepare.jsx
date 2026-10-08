@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useParams, useLocation } from 'react-router-dom'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-import { authHeaders } from '../api'
+import { senderFetch } from '../api'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 
@@ -43,13 +43,13 @@ export default function Prepare() {
     ;(async () => {
       try {
         // Presigned S3 URL — the PDF bytes don't pass through the API.
-        const pdfRes = await fetch(`/api/documents/${id}/pdf`, { headers: authHeaders() }).then(r => r.json())
+        const pdfRes = await senderFetch(`/api/documents/${id}/pdf`).then(r => r.json())
         if (pdfRes.error) throw new Error(pdfRes.error)
         const pdf = await pdfjsLib.getDocument({ url: pdfRes.url }).promise
         if (cancelled) return
         pdfRef.current = pdf
         setNumPages(pdf.numPages)
-        const saved = await fetch(`/api/documents/${id}/fields`, { headers: authHeaders() }).then(r => r.json())
+        const saved = await senderFetch(`/api/documents/${id}/fields`).then(r => r.json())
         if (!cancelled && saved.fields?.length) {
           setFields(saved.fields.map(f => ({ ...f, id: crypto.randomUUID() })))
         }
@@ -84,12 +84,12 @@ export default function Prepare() {
           required: f.required, sort_order: i,
         })),
       }
-      const put = await fetch(`/api/documents/${id}/fields`, {
-        method: 'PUT', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(payload),
+      const put = await senderFetch(`/api/documents/${id}/fields`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       }).then(r => r.json())
       if (put.error) throw new Error(put.error)
-      const send = await fetch(`/api/documents/${id}/send`, {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      const send = await senderFetch(`/api/documents/${id}/send`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ signer_email: signerEmail, cc_email: ccEmail }),
       }).then(r => r.json())
       if (send.error) throw new Error(send.error)

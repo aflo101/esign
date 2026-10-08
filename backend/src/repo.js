@@ -8,6 +8,11 @@
 //   DOC#<id>        FLD#<order>#<uuid>                   placed field
 //   DOC#<id>        META                                 document
 //   TOK#<token>     META                                 signing token (Phase 4, TTL'd)
+//   USER#<email>    META                                 sender account (invite-only)
+//   APIKEY#<sha256> META                                 script API key (hash only)
+//   LOGIN#<sha256>  META                                 magic-link token (hash only, TTL'd)
+//
+// GSI1 (GSI1PK, GSI1SK) indexes a sender's documents: OWNER#<email> / createdAt.
 //
 // SK prefixes sort EVT < FLD < META, so the Query result is partitioned in code.
 // Event SKs use fixed-width epoch millis + a monotonic counter: sequential writes inside
@@ -68,14 +73,19 @@ const isConditionFailure = (e) =>
 
 // --- documents ---------------------------------------------------------------
 
-export async function createDocument({ id, filename, originalHash, s3KeyOriginal, senderEmail }) {
+export async function createDocument({ id, filename, originalHash, s3KeyOriginal, senderEmail, ownerEmail, accountId }) {
+  const createdAt = new Date().toISOString();
+  const owner = ownerEmail ? String(ownerEmail).toLowerCase() : null;
   const item = {
     PK: docPk(id), SK: 'META', entity: 'document',
     id, filename, originalHash, s3KeyOriginal,
     senderEmail: senderEmail || null,
+    ownerEmail: owner, accountId: accountId || null,
+    // Sparse GSI keys: a doc with no owner is simply absent from every sender's list.
+    ...(owner ? { GSI1PK: `OWNER#${owner}`, GSI1SK: createdAt } : {}),
     signerEmail: null, signedHash: null, s3KeySigned: null,
     tokenNonce: null, status: 'uploaded',
-    createdAt: new Date().toISOString(),
+    createdAt,
   };
   await db().send(new PutCommand({
     TableName: TABLE, Item: item,
@@ -92,17 +102,20 @@ export async function getDocument(id, { consistent = false } = {}) {
 }
 
 /** Mark sent + rotate the token nonce. Rejects an already-executed document. */
-export async function markSent({ id, signerEmail, ccEmails = [], tokenNonce }) {
+export async function markSent({ id, signerEmail, ccEmails = [], tokenNonce, linkExpiresAt }) {
   try {
     // ccEmails is overwritten on every send, not appended to: a re-send re-states who the
     // recipients are, so a cc dropped from the second send must not survive from the first.
     const { Attributes } = await db().send(new UpdateCommand({
       TableName: TABLE, Key: { PK: docPk(id), SK: 'META' },
-      UpdateExpression: 'SET signerEmail = :s, ccEmails = :cc, tokenNonce = :n, #st = :sent',
-      ConditionExpression: 'attribute_exists(PK) AND #st <> :signed',
+      UpdateExpression: 'SET signerEmail = :s, ccEmails = :cc, tokenNonce = :n, #st = :sent, sentAt = :at, linkExpiresAt = :exp REMOVE revokedAt',
+      // 'signing' blocked too: rotating the nonce mid-submit would fail the in-flight
+      // commitSigned after the signer had already completed the document.
+      ConditionExpression: 'attribute_exists(PK) AND NOT (#st IN (:signed, :signing))',
       ExpressionAttributeNames: { '#st': 'status' },
       ExpressionAttributeValues: {
-        ':s': signerEmail, ':cc': ccEmails, ':n': tokenNonce, ':sent': 'sent', ':signed': 'signed',
+        ':s': signerEmail, ':cc': ccEmails, ':n': tokenNonce, ':sent': 'sent', ':signed': 'signed', ':signing': 'signing',
+        ':at': new Date().toISOString(), ':exp': linkExpiresAt ?? null,
       },
       ReturnValues: 'ALL_NEW',
     }));
@@ -111,6 +124,43 @@ export async function markSent({ id, signerEmail, ccEmails = [], tokenNonce }) {
     if (isConditionFailure(e)) return null; // already signed
     throw e;
   }
+}
+
+/**
+ * Revoke every outstanding link: rotate the nonce to a value no token carries, WITHOUT
+ * minting a replacement. Refuses signed/signing so a revoke can't race an in-flight submit.
+ * Returns null on condition failure (caller maps to 409).
+ */
+export async function revokeDocument(id) {
+  try {
+    const { Attributes } = await db().send(new UpdateCommand({
+      TableName: TABLE, Key: { PK: docPk(id), SK: 'META' },
+      UpdateExpression: 'SET tokenNonce = :n, #st = :r, revokedAt = :t',
+      // Only a sent document has live links to kill; revoking an unsent upload is a no-op.
+      ConditionExpression: 'attribute_exists(PK) AND #st = :sentst',
+      ExpressionAttributeNames: { '#st': 'status' },
+      ExpressionAttributeValues: {
+        ':sentst': 'sent',
+        ':n': `revoked-${crypto.randomBytes(9).toString('base64url')}`, ':r': 'revoked',
+        ':t': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    }));
+    return Attributes;
+  } catch (e) {
+    if (isConditionFailure(e)) return null;
+    throw e;
+  }
+}
+
+/** A sender's documents, newest first, via GSI1. Drains pagination. */
+export async function listDocumentsByOwner(email) {
+  return queryAll({
+    TableName: TABLE, IndexName: 'GSI1',
+    KeyConditionExpression: 'GSI1PK = :pk',
+    ExpressionAttributeValues: { ':pk': `OWNER#${String(email).toLowerCase()}` },
+    ScanIndexForward: false,
+  });
 }
 
 /**
@@ -278,6 +328,73 @@ export async function getToken(token) {
 
 export async function deleteToken(token) {
   await db().send(new DeleteCommand({ TableName: TABLE, Key: { PK: `TOK#${token}`, SK: 'META' } }));
+}
+
+// --- users, API keys, magic-link logins ---------------------------------------
+
+const sha256hex = (v) => crypto.createHash('sha256').update(v).digest('hex');
+const normEmail = (e) => String(e ?? '').trim().toLowerCase();
+
+export async function getUser(email) {
+  const { Item } = await db().send(new GetCommand({
+    TableName: TABLE, Key: { PK: `USER#${normEmail(email)}`, SK: 'META' }, ConsistentRead: true,
+  }));
+  return Item || null;
+}
+
+export async function putUser({ email, name, accountId, role = 'sender', disabled = false }) {
+  const item = {
+    PK: `USER#${normEmail(email)}`, SK: 'META', entity: 'user',
+    email: normEmail(email), name, accountId, role, disabled,
+    createdAt: new Date().toISOString(),
+  };
+  await db().send(new PutCommand({ TableName: TABLE, Item: item }));
+  return item;
+}
+
+/** Resolve a plaintext API key. Only the hash is stored. */
+export async function getApiKey(key) {
+  const { Item } = await db().send(new GetCommand({
+    TableName: TABLE, Key: { PK: `APIKEY#${sha256hex(key)}`, SK: 'META' },
+  }));
+  return Item || null;
+}
+
+export async function putApiKey({ key, email, label }) {
+  await db().send(new PutCommand({
+    TableName: TABLE,
+    Item: {
+      PK: `APIKEY#${sha256hex(key)}`, SK: 'META', entity: 'apikey',
+      email: normEmail(email), label: label || null, createdAt: new Date().toISOString(),
+    },
+  }));
+}
+
+export async function putLoginToken({ token, email, expiresAt }) {
+  await db().send(new PutCommand({
+    TableName: TABLE,
+    Item: {
+      PK: `LOGIN#${sha256hex(token)}`, SK: 'META', entity: 'login',
+      email: normEmail(email),
+      expiresAt,                                  // checked in code — authoritative
+      ttl: Math.floor(expiresAt / 1000) + 86400,  // GC only
+    },
+  }));
+}
+
+/** Single-use: the delete IS the check, so two concurrent verifies can't both win. */
+export async function consumeLoginToken(token) {
+  try {
+    const { Attributes } = await db().send(new DeleteCommand({
+      TableName: TABLE, Key: { PK: `LOGIN#${sha256hex(token)}`, SK: 'META' },
+      ConditionExpression: 'attribute_exists(PK)',
+      ReturnValues: 'ALL_OLD',
+    }));
+    return Attributes || null;
+  } catch (e) {
+    if (isConditionFailure(e)) return null;
+    throw e;
+  }
 }
 
 // --- rate limiting (atomic counter, no WAF) -----------------------------------

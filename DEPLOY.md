@@ -90,6 +90,34 @@ secret is doing its job and the function isn't publicly addressable.
 
 ---
 
+## Sender accounts cutover
+
+Multi-sender (magic-link login, per-owner documents). Scripts live in `backend/scripts/`;
+each needs `--table`, is a **dry run until `--apply`**, and never prints the API key.
+
+1. **Deploy** (above). Adds GSI1 in place (no table replacement), `LEGACY_SENDER_EMAIL`, and
+   forwards `X-Api-Key` through CloudFront. The GSI backfills for a few minutes; it is
+   additive and the table stays RETAIN + deletion-protected.
+2. **Find the prod table**: `aws cloudformation describe-stacks --stack-name EsignStack --query "Stacks[0].Outputs[?OutputKey=='TableName'].OutputValue" --output text --region us-east-1` -> `T`.
+3. **Seed senders** (dry run first, then add `--apply`):
+   ```bash
+   cd backend
+   node scripts/seed-user.js --table $T --email aflores@miltonindustries.com    --name "Alex Flores"     --account ripple --role admin
+   node scripts/seed-user.js --table $T --email smcquillan@miltonindustries.com --name "Sean McQuillan" --account milton --role sender
+   ```
+4. **Backfill existing documents to Alex** (docs with no owner are inaccessible until this runs):
+   `node scripts/backfill-owners.js --table $T --owner aflores@miltonindustries.com --account ripple --apply`
+5. **Issue Alex's API key** (for `send_round.py`):
+   `node scripts/issue-api-key.js --table $T --email aflores@miltonindustries.com --label send_round --out ~/Desktop/esign/SENDER-API-KEY.txt --apply`
+   Refuses to overwrite an existing file; delete the old file to rotate (old key stays valid until its `APIKEY#` item is deleted).
+6. **Smoke test**: request a magic link for Alex at the site, click it, confirm "My documents"
+   lists the backfilled docs; repeat for Sean (he should see none). Confirm a live signer link
+   (`/s/<token>`) still opens.
+7. **Later**: once magic-link is proven, remove `SENDER_PASSWORD_PARAM`, the `/esign/sender-password`
+   SSM parameter, and `LEGACY_SENDER_EMAIL` from the stack.
+
+---
+
 ## Diagnosing email delivery
 
 SES accepting a message does **not** mean anyone received it. To see the receiving mail

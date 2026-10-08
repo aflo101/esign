@@ -10,7 +10,7 @@ import { logEvent, clientIp } from './db.js';
 import * as repo from './repo.js';
 import { putObject, getObject, presignPut, presignGet, headObject } from './storage.js';
 import { sendEmail, normalizeCc } from './email.js';
-import { signatureRequestEmail, completionEmail } from './templates.js';
+import { signatureRequestEmail, completionEmail, magicLinkEmail } from './templates.js';
 
 const app = express();
 app.use(cors());
@@ -57,59 +57,178 @@ const tokenFingerprint = (token) => sha256(Buffer.from(token)).slice(0, 12);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// --- Sender auth (env-gated: enforced only when SENDER_PASSWORD is set) ---
-const SENDER_PASSWORD = process.env.SENDER_PASSWORD || null;
+// --- Sender auth ---------------------------------------------------------------
+// Invite-only accounts (USER# items). A sender proves identity by session JWT (magic-link
+// login, for the browser) or X-Api-Key (for scripts). Both resolve to a user record, and
+// requireSender sets req.sender = { email, name, accountId } — every ownership check and
+// every audit actor downstream derives from that, never from request bodies.
+const SENDER_PASSWORD = process.env.SENDER_PASSWORD || null;       // legacy cutover only
+const LEGACY_SENDER_EMAIL = (process.env.LEGACY_SENDER_EMAIL || '').trim().toLowerCase() || null;
 const IS_PROD = process.env.NODE_ENV === 'production';
+// Dev bypass can never be reached in production, even if the env var leaks in.
+const DEV_SENDER_EMAIL = !IS_PROD
+  ? ((process.env.DEV_SENDER_EMAIL || '').trim().toLowerCase() || null) : null;
 
-// Fail closed. Without this, a missing/failed secret lookup in production silently
-// disables sender auth and publishes an open upload + SES relay on a verified domain.
+// Fail closed: auth is always enforced; without a signing secret nothing can be verified.
 if (!process.env.JWT_SECRET) {
   throw new Error('JWT_SECRET is required');
 }
-if (IS_PROD && !SENDER_PASSWORD) {
-  throw new Error('SENDER_PASSWORD is required when NODE_ENV=production (refusing to start with auth disabled)');
+// Magic links and signing links are built from this; unset would mail out "undefined/login/...".
+if (IS_PROD && !process.env.APP_BASE_URL) {
+  throw new Error('APP_BASE_URL is required when NODE_ENV=production');
 }
 
-function requireSender(req, res, next) {
-  if (!SENDER_PASSWORD) return next(); // auth disabled in dev
+const MAGIC_LINK_TTL_MS = 15 * 60 * 1000;
+const SESSION_TTL = '12h';
+const normEmail = (e) => String(e ?? '').trim().toLowerCase();
+
+const senderOf = (user) => ({ email: user.email, name: user.name, accountId: user.accountId });
+const signSession = (user) => jwt.sign(
+  { role: 'sender', sub: user.email, name: user.name, acct: user.accountId },
+  process.env.JWT_SECRET, { expiresIn: SESSION_TTL },
+);
+
+/**
+ * Resolve the caller to a sender, or null. The user record is reloaded on every request
+ * (not trusted from the JWT) so disabling an account takes effect immediately rather than
+ * after the 12h session runs out.
+ */
+async function authenticate(req) {
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey) {
+    const rec = await repo.getApiKey(String(apiKey));
+    if (!rec) return null;
+    const user = await repo.getUser(rec.email);
+    return user && !user.disabled ? senderOf(user) : null;
+  }
   const h = req.headers.authorization || '';
   const t = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (t) {
+    try {
+      // Pin the algorithm (review hardening): never let the token header pick the verifier.
+      const p = jwt.verify(t, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+      if (p.role !== 'sender' || !p.sub) return null; // pre-accounts tokens carry no sub
+      const user = await repo.getUser(p.sub);
+      return user && !user.disabled ? senderOf(user) : null;
+    } catch { return null; }
+  }
+  if (DEV_SENDER_EMAIL) {
+    const user = await repo.getUser(DEV_SENDER_EMAIL).catch(() => null);
+    return user && !user.disabled
+      ? senderOf(user)
+      : { email: DEV_SENDER_EMAIL, name: user?.name || DEV_SENDER_EMAIL, accountId: user?.accountId || null };
+  }
+  return null;
+}
+
+async function requireSender(req, res, next) {
   try {
-    const p = jwt.verify(t, process.env.JWT_SECRET);
-    if (p.role !== 'sender') throw new Error('bad role');
-    return next();
-  } catch {
-    return res.status(401).json({ error: 'sender auth required' });
+    const sender = await authenticate(req);
+    if (!sender) return res.status(401).json({ error: 'sender auth required' });
+    req.sender = sender;
+    next();
+  } catch (e) {
+    console.error('auth failed:', e);
+    res.status(500).json({ error: 'auth unavailable' });
   }
 }
 
-// Reports whether the caller's bearer is actually USABLE, not just present. The UI gate
-// previously opened on the mere existence of a token in localStorage, so an expired or
-// invalid one left the app rendered with no working credential — every action 401'd and
-// the password prompt never appeared.
-app.get('/auth/status', (req, res) => {
-  let authenticated = false;
-  if (SENDER_PASSWORD) {
-    const h = req.headers.authorization || '';
-    const t = h.startsWith('Bearer ') ? h.slice(7) : null;
-    try {
-      authenticated = jwt.verify(t, process.env.JWT_SECRET).role === 'sender';
-    } catch { authenticated = false; }
+// Load a document the caller owns. 404 — not 403 — for both missing and not-yours, so
+// document ids can't be probed for existence. Docs without ownerEmail are inaccessible
+// until the backfill script assigns them. Sends the response itself and returns null.
+async function loadOwnedDoc(req, res, opts) {
+  const doc = await repo.getDocument(req.params.id, opts);
+  if (!doc || !doc.ownerEmail || doc.ownerEmail !== req.sender.email) {
+    res.status(404).json({ error: 'not found' });
+    return null;
   }
-  res.json({ authRequired: !!SENDER_PASSWORD, authenticated });
+  return doc;
+}
+
+// Reports whether the caller's credential is actually USABLE, not just present. The UI gate
+// previously opened on the mere existence of a token in localStorage, so an expired or
+// invalid one left the app rendered with no working credential.
+app.get('/auth/status', async (req, res) => {
+  try {
+    const sender = await authenticate(req);
+    res.json({
+      authRequired: true, authenticated: !!sender,
+      ...(sender ? { user: { email: sender.email, name: sender.name } } : {}),
+    });
+  } catch (e) {
+    console.error(e);
+    res.json({ authRequired: true, authenticated: false });
+  }
 });
+
+app.get('/auth/me', requireSender, (req, res) => {
+  res.json({ email: req.sender.email, name: req.sender.name, accountId: req.sender.accountId });
+});
+
+// Always 200 {ok:true}: the response must not reveal whether an address has an account.
+// Per-email limiting (on top of per-IP) stops a victim's inbox being flooded from many IPs.
+app.post('/auth/magic-link', rateLimit({ max: 10, windowSeconds: 900, name: 'magic' }), async (req, res) => {
+  try {
+    const email = normEmail(req.body?.email);
+    if (email && email.length <= 254 && LOOKS_LIKE_EMAIL.test(email)) {
+      const n = await repo.bumpRateLimit(`magicemail#${email}`, 900);
+      if (n <= 5) {
+        const user = await repo.getUser(email);
+        if (user && !user.disabled) {
+          // 256 bits; only the hash is stored, so a table read can't yield a usable link.
+          const token = crypto.randomBytes(32).toString('base64url');
+          await repo.putLoginToken({ token, email: user.email, expiresAt: Date.now() + MAGIC_LINK_TTL_MS });
+          const link = `${process.env.APP_BASE_URL}/login/${token}`;
+          try {
+            await sendEmail({ to: user.email, ...magicLinkEmail({ name: user.name, link, expiresMinutes: 15 }) });
+          } catch (err) {
+            console.error(`magic-link email to ${user.email} failed:`, err.message);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error('magic-link failed:', e);
+  }
+  res.json({ ok: true });
+});
+
+app.post('/auth/verify', rateLimit({ max: 20, windowSeconds: 900, name: 'verify' }), async (req, res) => {
+  try {
+    const token = String(req.body?.token ?? '');
+    if (!token || token.length > 200) return res.status(401).json({ error: 'invalid or expired link' });
+    const rec = await repo.consumeLoginToken(token);
+    // Expiry is checked in code; the TTL attribute is only garbage collection.
+    if (!rec || Date.now() > rec.expiresAt) return res.status(401).json({ error: 'invalid or expired link' });
+    const user = await repo.getUser(rec.email);
+    if (!user || user.disabled) return res.status(401).json({ error: 'invalid or expired link' });
+    res.json({ token: signSession(user), user: { email: user.email, name: user.name } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'verify failed' });
+  }
+});
+
+// Legacy shared password — cutover only. Issues a session for LEGACY_SENDER_EMAIL, which
+// must already exist as a user. Remove once everyone is on magic links.
 app.post('/auth/login', rateLimit({ max: 10, windowSeconds: 900, name: 'login' }), async (req, res) => {
-  if (!SENDER_PASSWORD) return res.json({ token: null, authRequired: false });
-  const supplied = String(req.body?.password ?? '');
-  // Constant-time compare over equal-length digests — a direct !== leaks the shared
-  // prefix length through timing.
-  const ok = crypto.timingSafeEqual(
-    crypto.createHash('sha256').update(supplied).digest(),
-    crypto.createHash('sha256').update(SENDER_PASSWORD).digest(),
-  );
-  if (!ok) return res.status(401).json({ error: 'invalid password' });
-  const token = jwt.sign({ role: 'sender' }, process.env.JWT_SECRET, { expiresIn: '12h' });
-  res.json({ token });
+  try {
+    if (!SENDER_PASSWORD || !LEGACY_SENDER_EMAIL) return res.status(401).json({ error: 'password login disabled' });
+    const supplied = String(req.body?.password ?? '');
+    // Constant-time compare over equal-length digests — a direct !== leaks the shared
+    // prefix length through timing.
+    const ok = crypto.timingSafeEqual(
+      crypto.createHash('sha256').update(supplied).digest(),
+      crypto.createHash('sha256').update(SENDER_PASSWORD).digest(),
+    );
+    if (!ok) return res.status(401).json({ error: 'invalid password' });
+    const user = await repo.getUser(LEGACY_SENDER_EMAIL);
+    if (!user || user.disabled) return res.status(401).json({ error: 'invalid password' });
+    res.json({ token: signSession(user), user: { email: user.email, name: user.name } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'login failed' });
+  }
 });
 
 // --- Rate limiting -----------------------------------------------------------
@@ -213,11 +332,20 @@ app.post('/documents/:id/complete', requireSender, async (req, res) => {
     }
     const hash = sha256(buf);
 
-    await repo.createDocument({
-      id, filename, originalHash: hash,
-      s3KeyOriginal: key, senderEmail: req.body.sender_email || null,
-    });
-    await logEvent(id, 'document_uploaded', req, { filename, size: head.size, hash });
+    try {
+      await repo.createDocument({
+        id, filename, originalHash: hash,
+        s3KeyOriginal: key, senderEmail: req.sender.email,
+        ownerEmail: req.sender.email, accountId: req.sender.accountId,
+      });
+    } catch (e) {
+      // Review fix: an id that already exists (any owner) must never be re-registered, and
+      // must not surface DynamoDB's raw error text as a 500. createDocument is conditional,
+      // so nothing was overwritten; answer 409 without saying whose document it is.
+      if (e?.name === 'ConditionalCheckFailedException') return res.status(409).json({ error: 'document already registered' });
+      throw e;
+    }
+    await logEvent(id, 'document_uploaded', req, { filename, size: head.size, hash, actor: req.sender.email });
     res.json({ id, hash, filename });
   } catch (e) {
     console.error(e);
@@ -231,15 +359,15 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     const { id } = req.params;
     const { signer_email, cc_email, cc_sender } = req.body;
     if (!signer_email) return res.status(400).json({ error: 'signer_email required' });
-    const doc = await repo.getDocument(id);
-    if (!doc) return res.status(404).json({ error: 'not found' });
+    const doc = await loadOwnedDoc(req, res);
+    if (!doc) return;
 
     // CC defaults to the sender. The sender already receives the completion mail but was
     // never copied on the request itself, so they had no record of what went out or of the
     // link they may need to re-share — which is exactly the gap that stranded two envelopes
     // for a fortnight. Derived from the document's own senderEmail rather than configured,
     // so a per-sender deployment needs no env var. Pass cc_sender:false to suppress it.
-    const senderCc = cc_sender === false ? [] : splitAddresses(doc.senderEmail);
+    const senderCc = cc_sender === false ? [] : splitAddresses(req.sender.email);
     const ccList = normalizeCc(
       [...senderCc, ...splitAddresses(process.env.SES_DEFAULT_CC), ...splitAddresses(cc_email)],
       signer_email,
@@ -254,7 +382,8 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     const nonce = crypto.randomBytes(9).toString('base64url');
     // An executed document is final — re-sending would reset it to 'sent' and allow
     // the signed contract to be signed again over the top of itself.
-    const updated = await repo.markSent({ id, signerEmail: signer_email, ccEmails: ccList, tokenNonce: nonce });
+    const linkExpiresAt = Date.now() + SIGNING_TOKEN_TTL_MS;
+    const updated = await repo.markSent({ id, signerEmail: signer_email, ccEmails: ccList, tokenNonce: nonce, linkExpiresAt });
     if (!updated) return res.status(409).json({ error: 'already signed' });
 
     // 128 bits of opaque randomness — short enough for a clean link, revocable, and
@@ -262,7 +391,7 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     const token = crypto.randomBytes(16).toString('base64url');
     await repo.putToken({
       token, docId: id, signerEmail: signer_email, nonce,
-      expiresAt: Date.now() + SIGNING_TOKEN_TTL_MS,
+      expiresAt: linkExpiresAt,
     });
     const link = `${process.env.APP_BASE_URL}/s/${token}`;
 
@@ -276,8 +405,8 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
         to: signer_email,
         cc: ccList,
         ...signatureRequestEmail({
-          senderName: process.env.SENDER_NAME || null,
-          senderEmail: doc.senderEmail || process.env.SES_FROM || null,
+          senderName: req.sender.name,
+          senderEmail: req.sender.email,
           filename: doc.filename,
           link,
           expiresDays: 7,
@@ -292,7 +421,7 @@ app.post('/documents/:id/send', requireSender, async (req, res) => {
     // cc recipients are recorded because they hold a signable credential — the evidence
     // package must show who else received the link, not just the named signer.
     await logEvent(id, emailError ? 'link_send_failed' : 'link_sent', req, {
-      signer_email, ...(ccList.length ? { cc_emails: ccList } : {}),
+      actor: req.sender.email, signer_email, ...(ccList.length ? { cc_emails: ccList } : {}),
       token_fp: tokenFingerprint(token), ...(emailError ? { error: emailError } : {}),
     });
     res.json({
@@ -315,8 +444,8 @@ const FIELD_TYPES = new Set(['signature', 'initials', 'date', 'name', 'text', 'c
 // Presigned URL for the original PDF (sender's Prepare page). Returns {url}, not bytes.
 app.get('/documents/:id/pdf', requireSender, async (req, res) => {
   try {
-    const doc = await repo.getDocument(req.params.id);
-    if (!doc) return res.status(404).json({ error: 'not found' });
+    const doc = await loadOwnedDoc(req, res);
+    if (!doc) return;
     res.json({ url: await presignGet(doc.s3KeyOriginal) });
   } catch (e) {
     console.error(e);
@@ -327,6 +456,7 @@ app.get('/documents/:id/pdf', requireSender, async (req, res) => {
 // List placed fields for a document
 app.get('/documents/:id/fields', requireSender, async (req, res) => {
   try {
+    if (!await loadOwnedDoc(req, res)) return;
     const fields = await repo.listFields(req.params.id);
     res.json({ fields: fields.map(wireField) });
   } catch (e) {
@@ -342,8 +472,8 @@ app.put('/documents/:id/fields', requireSender, async (req, res) => {
   if (!incoming) return res.status(400).json({ error: 'fields array required' });
 
   try {
-    const doc = await repo.getDocument(id, { consistent: true });
-    if (!doc) return res.status(404).json({ error: 'not found' });
+    const doc = await loadOwnedDoc(req, res, { consistent: true });
+    if (!doc) return;
     // 'signing' means a submit is mid-flight against the current field set — moving the
     // fields underneath it would flatten values at coordinates the signer never saw.
     if (['signed', 'signing'].includes(doc.status)) {
@@ -365,7 +495,7 @@ app.put('/documents/:id/fields', requireSender, async (req, res) => {
     });
 
     await repo.replaceFields(id, clean);
-    await logEvent(id, 'fields_placed', req, { count: clean.length, types: clean.map(f => f.type) });
+    await logEvent(id, 'fields_placed', req, { count: clean.length, types: clean.map(f => f.type), actor: req.sender.email });
     res.json({ ok: true, count: clean.length });
   } catch (e) {
     console.error(e);
@@ -596,9 +726,66 @@ async function deliverCompletion({ doc, signedHash, signedBytes, req }) {
 // 5. Evidence package
 app.get('/documents/:id/evidence', requireSender, async (req, res) => {
   try {
+    if (!await loadOwnedDoc(req, res)) return;
     const key = await ensureEvidence(req.params.id);
     res.json({ url: await presignGet(key, 'evidence.pdf') });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Sender-side: dashboard list, detail, signed download, revoke ---
+const wireDoc = (d) => ({
+  id: d.id, filename: d.filename, status: d.status,
+  signerEmail: d.signerEmail ?? null, ccEmails: d.ccEmails || [],
+  createdAt: d.createdAt, sentAt: d.sentAt ?? null, signedAt: d.signedAt ?? null,
+  linkExpiresAt: d.linkExpiresAt ?? null, revokedAt: d.revokedAt ?? null,
+});
+
+app.get('/documents', requireSender, async (req, res) => {
+  try {
+    const docs = await repo.listDocumentsByOwner(req.sender.email);
+    res.json({ documents: docs.map(wireDoc) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/documents/:id', requireSender, async (req, res) => {
+  try {
+    const doc = await loadOwnedDoc(req, res);
+    if (!doc) return;
+    res.json(wireDoc(doc));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/documents/:id/signed', requireSender, async (req, res) => {
+  try {
+    const doc = await loadOwnedDoc(req, res, { consistent: true });
+    if (!doc) return;
+    if (doc.status !== 'signed' || !doc.s3KeySigned) return res.status(409).json({ error: 'not signed yet' });
+    res.json({ url: await presignGet(doc.s3KeySigned, `signed-${doc.filename}`) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Kills every outstanding link by rotating the nonce (resolveSigningToken compares it) and
+// issues none in its place. A later /send mints a fresh nonce, so re-sending still works.
+app.post('/documents/:id/revoke', requireSender, async (req, res) => {
+  try {
+    if (!await loadOwnedDoc(req, res, { consistent: true })) return;
+    const updated = await repo.revokeDocument(req.params.id);
+    if (!updated) return res.status(409).json({ error: 'only a sent, unsigned document can be revoked' });
+    await logEvent(req.params.id, 'link_revoked', req, { actor: req.sender.email });
+    res.json(wireDoc(updated));
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 });

@@ -1,11 +1,10 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { authHeaders } from '../api'
+import { senderFetch } from '../api'
 
 export default function Upload() {
   const navigate = useNavigate()
   const [file, setFile] = useState(null)
-  const [senderEmail, setSenderEmail] = useState('')
   const [signerEmail, setSignerEmail] = useState('')
   const [ccEmail, setCcEmail] = useState('')
   const [busy, setBusy] = useState(false)
@@ -17,8 +16,8 @@ export default function Upload() {
     try {
       // Three steps: mint a presigned URL, PUT the bytes straight to S3, then register.
       // The file never passes through the API — Lambda caps payloads at 6MB.
-      const init = await fetch('/api/documents/init', {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      const init = await senderFetch('/api/documents/init', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename: file.name }),
       }).then(r => r.json())
       if (init.error) throw new Error(init.error)
@@ -29,14 +28,14 @@ export default function Upload() {
       })
       if (!put.ok) throw new Error(`upload failed (${put.status})`)
 
-      const up = await fetch(`/api/documents/${init.id}/complete`, {
-        method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ filename: file.name, sender_email: senderEmail }),
+      const up = await senderFetch(`/api/documents/${init.id}/complete`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name }),
       }).then(r => r.json())
       if (up.error) throw new Error(up.error)
       // Hand off to the Prepare step (place fields, then send) — carry the emails forward.
       navigate(`/prepare/${up.id}`, {
-        state: { sender_email: senderEmail, signer_email: signerEmail, cc_email: ccEmail, filename: up.filename },
+        state: { signer_email: signerEmail, cc_email: ccEmail, filename: up.filename },
       })
     } catch (e) {
       setError(e.message)
@@ -52,10 +51,6 @@ export default function Upload() {
         <div className="field">
           <label>PDF document</label>
           <input type="file" accept="application/pdf" onChange={e => setFile(e.target.files[0])} required />
-        </div>
-        <div className="field">
-          <label>Your email (sender)</label>
-          <input type="email" value={senderEmail} onChange={e => setSenderEmail(e.target.value)} required placeholder="you@example.com" />
         </div>
         <div className="field">
           <label>Signer's email</label>
